@@ -1930,11 +1930,37 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         if (soft_reset || nonreturn_arm_call ||
             nonreturn_thumb_suffixes.count(ins.pc) != 0) break;
 
+        // ARM `<op>cc pc,...` (conditional indirect transfer / return) that is
+        // immediately followed by a direct branch on the COMPLEMENTARY
+        // condition, e.g. the switch idiom
+        //     ldrne pc,[pc,r1,lsl #2]
+        //     beq   default
+        //     .word target0, target1, ...      @ inline table
+        // covers both edges: cc takes the indirect transfer, !cc takes the
+        // branch. Nothing architecturally follows the branch, so the pair is
+        // one terminating unit of THIS function. Seeding the branch as its
+        // own root would lose that context and walk its (unreachable) not-
+        // taken edge into the inline table bytes.
+        bool paired_indirect = false;
+        if (entry_mode == CpuMode::Arm &&
+            (ins.is_return || ins.is_indirect) &&
+            static_cast<uint8_t>(ins.cond) < 14 &&
+            can_read_walk_at(pc, 4)) {
+            const armv4t::Instr next =
+                armv4t::ArmDecoder::decode(read_walk_u32(pc), pc);
+            paired_indirect = !next.is_undefined && next.is_branch &&
+                !next.is_indirect && !next.is_call && !next.is_return &&
+                static_cast<uint8_t>(next.cond) < 14 &&
+                (static_cast<uint8_t>(next.cond) ^ 1u) ==
+                    static_cast<uint8_t>(ins.cond);
+        }
+
         // A conditional indirect transfer is not a terminator when
         // its condition fails. Because the finder stops at indirects,
-        // seed the fall-through root explicitly.
+        // seed the fall-through root explicitly (unless the complementary
+        // branch above continues this same function).
         if ((ins.is_return || ins.is_indirect) &&
-            ins.cond != armv4t::Cond::AL) {
+            ins.cond != armv4t::Cond::AL && !paired_indirect) {
             enqueue_resolved_target(pc, entry_mode, "branch");
         }
 
@@ -1944,7 +1970,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         //   2. An indirect control transfer.
         //   3. An unconditional branch (B with cond=AL) — we'll
         //      reach the target by adding it to the worklist.
-        if (ins.is_return || ins.is_indirect) {
+        if ((ins.is_return || ins.is_indirect) && !paired_indirect) {
             break;
         }
         bool unconditional_branch =
@@ -1958,7 +1984,8 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             unconditional_branch = true;
         }
 
-        if (ins.is_branch && !ins.is_call && static_cast<uint8_t>(ins.cond) < 14) {
+        if ((ins.is_branch && !ins.is_call && static_cast<uint8_t>(ins.cond) < 14) ||
+            paired_indirect) {
             last_cond_branch_pc = ins.pc;
             last_cond_branch_cond = ins.cond;
         } else {
