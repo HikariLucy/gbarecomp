@@ -567,6 +567,7 @@ uint16_t GbaIo::ie()      const { return load_u16(&io_[IoReg::IE]); }
 uint16_t GbaIo::if_reg()  const { return load_u16(&io_[IoReg::IF]); }
 bool     GbaIo::ime()     const { return (load_u16(&io_[IoReg::IME]) & 1u) != 0; }
 uint16_t GbaIo::dispstat() const { return load_u16(&io_[IoReg::DISPSTAT]); }
+uint16_t GbaIo::waitcnt() const { return load_u16(&io_[IoReg::WAITCNT]); }
 
 void GbaIo::warn_unhandled(uint32_t off, uint32_t value, bool is_write, uint8_t width) {
     ++unmapped_count_;

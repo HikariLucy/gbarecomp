@@ -499,17 +499,15 @@ void GbaBus::write32(uint32_t addr, uint32_t v) {
 //   * GBATEK § "GBA Cycle Times"
 //   * ARM7TDMI TRM § "Memory Access Cycles"
 //
-// Cycle counts assume default WAITCNT (0x0000). Bus width and
-// waitstate combine: every 16-bit-bus region costs 2 cycles per
-// 32-bit access (two consecutive halfword bus cycles); EWRAM adds
-// 2 waitstates on top of that.
+// Game Pak timings use the current WAITCNT stored by GbaIo. A 32-bit ROM
+// access comprises two 16-bit transfers; its second half is sequential.
+// Prefetch enable (bit 14) is stored but cartridge prefetch-buffer timing
+// is not modeled here.
 //
 // `sequential` is the ARM7TDMI "S" cycle (an access immediately
 // following another in the same area). For ARM/THUMB on the GBA
-// most regions have S=N=1 for 16-bit and 1S=1N=1 / 2S=2N=2 for
-// 32-bit, but ROM with WAITCNT > 0 gets a faster S than N. We use
-// the same value for S/N in regions where they match and split
-// only where they don't (ROM).
+// most regions have matching S/N costs. ROM has separate programmed
+// N and S fields for each Game Pak waitstate bank.
 uint32_t GbaBus::access_cycles(uint32_t addr, uint8_t width,
                                bool sequential) const {
     // 8-bit accesses use the same cycle count as 16-bit on hardware
@@ -531,15 +529,22 @@ uint32_t GbaBus::access_cycles(uint32_t addr, uint8_t width,
             return (w == 4) ? 6u : 3u;
         case 0x8: case 0x9:  // ROM WS0
         case 0xA: case 0xB:  // ROM WS1
-        case 0xC: case 0xD:  // ROM WS2
-            // Default WAITCNT 0x0000. mGBA's waitstate tables store
-            // the external wait component (N16=4, S16=2, N32=7,
-            // S32=5); the data-access helper needs the full bus
-            // access cost, so add the one base bus cycle here.
-            if (w == 4) return sequential ? 6u : 8u;
-            return sequential ? 3u : 5u;
-        case 0xE:  // SRAM / Flash region — 8-bit bus, ~5 cycles
-            return 5;
+        case 0xC: case 0xD: { // ROM WS2
+            static constexpr uint32_t first[4] = {5, 4, 3, 9};
+            static constexpr uint32_t second[3][2] = {
+                {3, 2}, {5, 2}, {9, 2}
+            };
+            const uint16_t control = io_dispatch_.waitcnt();
+            const uint32_t bank = (region - 8u) / 2u;
+            const uint32_t shift = 2u + 3u * bank;
+            const uint32_t n16 = first[(control >> shift) & 3u];
+            const uint32_t s16 = second[bank][(control >> (shift + 2u)) & 1u];
+            return (sequential ? s16 : n16) + (w == 4 ? s16 : 0u);
+        }
+        case 0xE: { // SRAM / Flash: one 8-bit Game Pak transfer
+            static constexpr uint32_t sram[4] = {5, 4, 3, 9};
+            return sram[io_dispatch_.waitcnt() & 3u];
+        }
         default:
             return 1;
     }

@@ -156,6 +156,8 @@ public:
     uint16_t if_reg()  const;
     bool     ime()     const;
     uint16_t dispstat() const;
+    // Single source of truth for programmed Game Pak wait controls.
+    uint16_t waitcnt() const;
 
     // For tests / debug.
     std::size_t unmapped_count() const { return unmapped_count_; }
