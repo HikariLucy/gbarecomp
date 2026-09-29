@@ -1147,6 +1147,9 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         return true;
     };
 
+    uint32_t last_cond_branch_pc = 0;
+    armv4t::Cond last_cond_branch_cond = armv4t::Cond::AL;
+
     while (count++ < kMaxInstrs && can_read_walk_at(pc, step)) {
         // If we ever decode from inside a data_range, that's a hard
         // error — TOML asserted "no code here" but our walk got here
@@ -1881,10 +1884,25 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         if (ins.is_return || ins.is_indirect) {
             break;
         }
-        const bool unconditional_branch =
+        bool unconditional_branch =
             ins.is_branch &&
             ins.cond == armv4t::Cond::AL &&
             !ins.is_call;
+        if (!unconditional_branch && ins.is_branch && !ins.is_call &&
+            last_cond_branch_pc == ins.pc - step &&
+            (static_cast<uint8_t>(last_cond_branch_cond) ^ 1) == static_cast<uint8_t>(ins.cond) &&
+            static_cast<uint8_t>(ins.cond) < 14) {
+            unconditional_branch = true;
+        }
+
+        if (ins.is_branch && !ins.is_call && static_cast<uint8_t>(ins.cond) < 14) {
+            last_cond_branch_pc = ins.pc;
+            last_cond_branch_cond = ins.cond;
+        } else {
+            last_cond_branch_pc = 0;
+            last_cond_branch_cond = armv4t::Cond::AL;
+        }
+
         if (unconditional_branch) {
             break;
         }
