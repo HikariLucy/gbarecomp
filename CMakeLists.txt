@@ -818,6 +818,34 @@ if(Python3_Interpreter_FOUND AND UNIX)
             "${PRIVATE_RELOC_FIXTURE_DIR}/fixture.gba")
 endif()
 
+if(Python3_Interpreter_FOUND AND UNIX)
+    set(ISCFG_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/image_scoped_cfg_fixture")
+    set(ISCFG_GENERATED_DIR "${ISCFG_FIXTURE_DIR}/generated")
+    add_custom_command(
+        OUTPUT
+            "${ISCFG_GENERATED_DIR}/recompiled.h"
+            "${ISCFG_GENERATED_DIR}/recompiled_000.cpp"
+            "${ISCFG_GENERATED_DIR}/recompiled_001.cpp"
+            "${ISCFG_GENERATED_DIR}/dispatch_table.cpp"
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/image_scoped_cfg/generate_fixture.py"
+            "$<TARGET_FILE:gba_recompile>"
+            "${ISCFG_FIXTURE_DIR}"
+        DEPENDS gba_recompile
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/image_scoped_cfg/generate_fixture.py"
+        VERBATIM)
+    add_executable(image_scoped_cfg_runtime_tests
+        tests/recompile/image_scoped_cfg/runtime_test.cpp
+        "${ISCFG_GENERATED_DIR}/recompiled_000.cpp"
+        "${ISCFG_GENERATED_DIR}/recompiled_001.cpp"
+        "${ISCFG_GENERATED_DIR}/dispatch_table.cpp")
+    target_include_directories(image_scoped_cfg_runtime_tests PRIVATE
+        "${ISCFG_GENERATED_DIR}" src/armv4t src/gba src/runtime)
+    target_link_gbarecomp_runtime_stack(image_scoped_cfg_runtime_tests)
+    add_test(NAME image_scoped_cfg_runtime_tests
+        COMMAND image_scoped_cfg_runtime_tests "${ISCFG_FIXTURE_DIR}")
+endif()
+
 add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
 target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME function_finder_tests COMMAND function_finder_tests)
