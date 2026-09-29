@@ -880,6 +880,34 @@ if(Python3_Interpreter_FOUND AND UNIX)
         COMMAND conditional_pc_load_runtime_tests "${CPL_FIXTURE_DIR}")
 endif()
 
+if(Python3_Interpreter_FOUND AND UNIX)
+    set(ICR_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/indirect_call_return_fixture")
+    set(ICR_GENERATED_DIR "${ICR_FIXTURE_DIR}/generated")
+    add_custom_command(
+        OUTPUT
+            "${ICR_GENERATED_DIR}/recompiled.h"
+            "${ICR_GENERATED_DIR}/recompiled_000.cpp"
+            "${ICR_GENERATED_DIR}/recompiled_001.cpp"
+            "${ICR_GENERATED_DIR}/dispatch_table.cpp"
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/indirect_call_return/generate_fixture.py"
+            "$<TARGET_FILE:gba_recompile>"
+            "${ICR_FIXTURE_DIR}"
+        DEPENDS gba_recompile
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/indirect_call_return/generate_fixture.py"
+        VERBATIM)
+    add_executable(indirect_call_return_runtime_tests
+        tests/recompile/indirect_call_return/runtime_test.cpp
+        "${ICR_GENERATED_DIR}/recompiled_000.cpp"
+        "${ICR_GENERATED_DIR}/recompiled_001.cpp"
+        "${ICR_GENERATED_DIR}/dispatch_table.cpp")
+    target_include_directories(indirect_call_return_runtime_tests PRIVATE
+        "${ICR_GENERATED_DIR}" src/armv4t src/gba src/runtime)
+    target_link_gbarecomp_runtime_stack(indirect_call_return_runtime_tests)
+    add_test(NAME indirect_call_return_runtime_tests
+        COMMAND indirect_call_return_runtime_tests "${ICR_FIXTURE_DIR}")
+endif()
+
 add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
 target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME function_finder_tests COMMAND function_finder_tests)
