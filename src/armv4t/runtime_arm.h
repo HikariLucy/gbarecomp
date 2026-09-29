@@ -176,6 +176,11 @@ void runtime_force_interp_step(void);
 // no reliable stop address (a top-level / exception-return miss).
 int runtime_has_static_entry(uint32_t pc, int thumb);
 
+// Explicit game-owned entry point. Caller must verify the complete mutable
+// RAM image before each invocation. Generated cart output supplies this
+// function; ordinary runtime_dispatch never calls it.
+int runtime_invoke_private_entry(uint32_t pc, int thumb);
+
 // The interpret-the-missed-subtree core of the on-miss bridge, factored so the
 // P6 sljit differential gate can reuse it as its "interpreter pass" (the kept
 // result a healed shard is validated against). Interprets from (entry_pc,

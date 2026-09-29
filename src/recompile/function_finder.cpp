@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 #include "arm_decode.h"
 #include "thumb_decode.h"
@@ -471,6 +472,16 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             (static_cast<uint32_t>(rom_[off + 1]) << 8) |
             (static_cast<uint32_t>(rom_[off + 2]) << 16) |
             (static_cast<uint32_t>(rom_[off + 3]) << 24);
+    };
+    auto can_read_literal = [&](uint32_t addr) {
+        return can_read_at(addr, 4) ||
+            (private_entry && addr >= 0x02000000u &&
+             addr < 0x04000000u && can_read_walk_at(addr, 4));
+    };
+    auto read_literal = [&](uint32_t addr) {
+        return (private_entry && addr >= 0x02000000u &&
+                addr < 0x04000000u)
+            ? read_walk_u32(addr) : read_u32(addr);
     };
     uint64_t key = visit_key(entry_addr, entry_mode);
     if (visited_.find(key) != visited_.end()) return;
@@ -1130,6 +1141,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             ++stats_.undefined_instr_count;
             break;
         }
+        fn.instruction_addrs.push_back(pc);
 
         // Record direct branch targets. The decoder fills
         // branch_target with the absolute guest address.
@@ -1218,8 +1230,8 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 enqueue_resolved_target(resolved, entry_mode, "branch");
             } else if (ins.op == armv4t::IrOp::LDR && ins.rd == 15) {
                 uint32_t ea = 0;
-                if (eval_mem_imm_addr(ins, &ea) && can_read_at(ea, 4)) {
-                    uint32_t raw = read_u32(ea & ~uint32_t{3});
+                if (eval_mem_imm_addr(ins, &ea) && can_read_literal(ea)) {
+                    uint32_t raw = read_literal(ea & ~uint32_t{3});
                     raw = ror32(raw, (ea & 3u) * 8u);
                     CpuMode target_mode = (raw & 1u)
                         ? CpuMode::Thumb : entry_mode;
@@ -1639,8 +1651,8 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             } else if (ins.op == armv4t::IrOp::LDR &&
                        !ins.mem.writeback) {
                 uint32_t ea = 0;
-                if (eval_mem_imm_addr(ins, &ea) && can_read_at(ea, 4)) {
-                    uint32_t raw = read_u32(ea & ~uint32_t{3});
+                if (eval_mem_imm_addr(ins, &ea) && can_read_literal(ea)) {
+                    uint32_t raw = read_literal(ea & ~uint32_t{3});
                     raw = ror32(raw, (ea & 3u) * 8u);
                     reg_const[ins.rd].known = true;
                     reg_const[ins.rd].value = raw;
@@ -1887,9 +1899,22 @@ void FunctionFinder::run(std::size_t max_functions) {
     for (const auto& s : seeds_) {
         uint64_t k = visit_key(s.addr, s.mode);
         seed_keys.insert(k);
+        auto prior = seed_by_key.find(k);
+        if (s.dispatch_declared && prior != seed_by_key.end() &&
+            prior->second.dispatch_declared &&
+            (prior->second.private_entry != s.private_entry ||
+             (prior->second.source_addr && s.source_addr &&
+              prior->second.source_addr != s.source_addr))) {
+            std::fprintf(stderr,
+                "[finder] conflicting explicit dispatch/source policy at "
+                "0x%08X (%s)\n", s.addr,
+                s.mode == CpuMode::Thumb ? "Thumb" : "ARM");
+            throw std::runtime_error("conflicting explicit dispatch policy");
+        }
         // An explicit private relocation must outrank an older implicit seed
         // at the same runtime PC; its ROM backing determines this CFG.
-        if (s.private_entry) seed_by_key[k] = s;
+        if (s.dispatch_declared && (s.private_entry || prior == seed_by_key.end() ||
+            !prior->second.dispatch_declared)) seed_by_key[k] = s;
         else seed_by_key.emplace(k, s);
     }
     stats_.manual_seeds_total = manual_seed_count;
@@ -2003,10 +2028,22 @@ void FunctionFinder::run(std::size_t max_functions) {
             }
             FunctionSeed target{t, fn.mode, "", target_source,
                                 s.speculative};
-            target.private_entry = fn.private_entry;
-            if (fn.private_entry) {
+            // Relocation applies only while control stays in the same RAM
+            // image. Calls into ROM keep their ordinary public policy.
+            const bool same_image = fn.private_entry &&
+                t >= 0x02000000u && t < 0x04000000u &&
+                target_source != 0;
+            target.private_entry = same_image;
+            if (same_image) {
                 auto existing = seed_by_key.find(k);
                 if (existing != seed_by_key.end()) {
+                    if (existing->second.dispatch_declared &&
+                        !existing->second.private_entry) {
+                        std::fprintf(stderr,
+                            "[finder] private CFG conflicts with public "
+                            "entry at 0x%08X\n", t);
+                        throw std::runtime_error("ambiguous private CFG entry");
+                    }
                     existing->second.private_entry = true;
                     existing->second.source_addr = target_source;
                 }
@@ -2192,12 +2229,9 @@ void FunctionFinder::run(std::size_t max_functions) {
             [](const Function& f) { return f.private_entry; })) {
         for (Function& f : functions_) {
             if (!static_resume_all_ && !f.private_entry) continue;
-            const uint32_t step =
-                f.mode == CpuMode::Thumb ? 2u : 4u;
-            for (uint32_t pc = f.addr + step;
-                 pc < f.end_addr && pc > f.addr;
-                 pc += step) {
-                f.alias_entries.push_back(pc);
+            for (uint32_t pc : f.instruction_addrs) {
+                if (pc > f.addr && pc < f.end_addr)
+                    f.alias_entries.push_back(pc);
             }
             if (!f.alias_entries.empty()) {
                 std::sort(f.alias_entries.begin(), f.alias_entries.end());

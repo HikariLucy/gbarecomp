@@ -585,6 +585,36 @@ void write_dispatch_table(const std::string& dir,
         "};\n"
         "extern \"C\" const unsigned %s = %zu;\n",
         names.table_len_symbol.c_str(), entries.size());
+    if (names.table_symbol == "kDispatchTable") {
+        const auto private_entries =
+            gbarecomp::build_private_dispatch_table_entries(funcs);
+        std::fprintf(f,
+            "\n// Explicit, byte-verified game hooks only. Ordinary dispatch "
+            "never reads this table.\n"
+            "extern \"C\" const DispatchEntry kPrivateDispatchTable[] = {\n");
+        for (const auto& entry : private_entries) {
+            const auto& fn = funcs[entry.function_index];
+            std::fprintf(f, "    {0x%08Xu, %uu, %uu, %s},\n",
+                         entry.addr, entry.thumb ? 1u : 0u,
+                         entry.resume ? 1u : 0u, fn.name.c_str());
+        }
+        std::fprintf(f,
+            "};\nextern \"C\" const unsigned kPrivateDispatchTableLen "
+            "= %zu;\n"
+            "extern \"C\" uint32_t g_runtime_resume_pc;\n"
+            "extern \"C\" int runtime_invoke_private_entry(uint32_t pc, "
+            "int thumb) {\n"
+            "    for (unsigned i = 0; i < kPrivateDispatchTableLen; ++i) {\n"
+            "        const auto& e = kPrivateDispatchTable[i];\n"
+            "        if (e.addr != (pc & ~1u) || e.thumb != (thumb != 0)) "
+            "continue;\n"
+            "        g_runtime_resume_pc = e.resume ? e.addr : 0u;\n"
+            "        e.fn();\n"
+            "        return 1;\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n", private_entries.size());
+    }
     std::fclose(f);
     commit_generated_file(temp, path);
 }
@@ -1208,6 +1238,7 @@ int main(int argc, char** argv) {
             seed.source_addr = ef.source_addr;
             seed.alias_candidate = ef.resume;  // interior/resume seed -> alias
             seed.private_entry = ef.private_entry;
+            seed.dispatch_declared = true;
             finder.add_seed(seed);
         }
         for (const auto& rr : cfg.resume_ranges) {
@@ -1422,6 +1453,24 @@ int main(int argc, char** argv) {
     sanitize_function_identifiers(emit_funcs, /*prefix_guest=*/!cli.bios_mode);
     if (!cli.output_prefix.empty()) {
         for (auto& fn : emit_funcs) fn.name = cli.output_prefix + fn.name;
+    }
+    if (!cli.bios_mode) {
+        const auto public_entries =
+            gbarecomp::build_dispatch_table_entries(emit_funcs);
+        const auto private_entries =
+            gbarecomp::build_private_dispatch_table_entries(emit_funcs);
+        std::unordered_set<uint64_t> public_keys;
+        for (const auto& e : public_entries)
+            public_keys.insert((static_cast<uint64_t>(e.addr) << 1) | e.thumb);
+        for (const auto& e : private_entries) {
+            if (public_keys.count((static_cast<uint64_t>(e.addr) << 1) |
+                                  e.thumb)) {
+                std::fprintf(stderr,
+                    "private/public dispatch collision at 0x%08X (%s)\n",
+                    e.addr, e.thumb ? "Thumb" : "ARM");
+                return 1;
+            }
+        }
     }
 
     OutputNames names = names_for_mode(cli.bios_mode, cli.output_prefix);

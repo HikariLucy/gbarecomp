@@ -33,16 +33,7 @@ int verified_ram_hook(std::uint32_t pc, int thumb) {
     for (std::uint32_t i = 0; i < 0x30u; ++i)
         if (bus->read8(0x03001000u + i) !=
             bus->read8(0x08000100u + i)) return 0;
-    if (pc < 0x0300100Au) {
-        g_runtime_resume_pc = pc == 0x03001000u ? 0u : pc;
-        gf_private_ram_callback();
-    } else if (pc >= 0x0300100Cu) {
-        g_runtime_resume_pc = pc == 0x0300100Cu ? 0u : pc;
-        gf_tfunc_0300100C();
-    } else {
-        return 0;
-    }
-    return 1;
+    return runtime_invoke_private_entry(pc, thumb);
 }
 void irq_vector() {
     check(g_irq_nest_depth == 1u || g_irq_nest_depth == 2u,
@@ -101,7 +92,9 @@ int main(int argc, char** argv) {
     for (std::uint32_t i = 0; i < 0x30; ++i)
         bus.write8(0x03001000u + i, rom[0x100 + i]);
     check(!runtime_has_static_entry(0x03001000u, 1), "private root is dispatchable");
+    check(!runtime_has_static_entry(0x03001004u, 1), "private resume is dispatchable");
     check(!runtime_has_static_entry(0x0300100Cu, 1), "private CFG child is dispatchable");
+    check(runtime_has_static_entry(0x08000100u, 1), "public ROM entry missing");
     // A mismatching mutable image must decline the hook and miss ordinary
     // strict-static dispatch. The child traps a forbidden native entry.
     const pid_t child = fork();

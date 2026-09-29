@@ -46,10 +46,14 @@ subprocess.run((str(compiler), '--rom', str(rom_path), '--config', str(config),
                stdout=subprocess.DEVNULL)
 header = (out / 'recompiled.h').read_text()
 table = (out / 'dispatch_table.cpp').read_text()
+public_table, private_table = table.split('kPrivateDispatchTable[]', 1)
 body = ''.join(path.read_text() for path in out.glob('recompiled_*.cpp'))
 assert 'gf_private_ram_callback(void)' in header
 assert 'gf_private_ram_callback(void)' in body
-assert '0x03001000u' not in table and '0x0300100Cu' not in table
+assert '0x03001000u' not in public_table and '0x0300100Cu' not in public_table
+assert '0x03001000u' in private_table and '0x03001004u' in private_table
+assert '0x0300100Au' not in private_table  # skipped branch padding
+assert '0x03001020u' not in private_table  # literal pool
 assert 'g_runtime_fn_entry_hook(0x03001000u)' in body
 assert '03001008 T b 0x0300100c' in body
 assert '0x03001006u & ~3u' in body

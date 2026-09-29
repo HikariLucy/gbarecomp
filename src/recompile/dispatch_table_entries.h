@@ -21,5 +21,7 @@ struct DispatchTableEntrySpec {
 // sufficient when an alias crosses the next host.
 std::vector<DispatchTableEntrySpec> build_dispatch_table_entries(
     const std::vector<Function>& functions);
+std::vector<DispatchTableEntrySpec> build_private_dispatch_table_entries(
+    const std::vector<Function>& functions);
 
 }  // namespace gbarecomp

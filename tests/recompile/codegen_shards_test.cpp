@@ -82,6 +82,14 @@ int main() {
         std::fprintf(stderr, "private function leaked into dispatch table\n");
         ok = false;
     }
+    const auto verified_entries =
+        gbarecomp::build_private_dispatch_table_entries({private_fn});
+    if (verified_entries.size() != 2 ||
+        verified_entries[0].addr != 0x03001000u ||
+        verified_entries[1].addr != 0x03001002u) {
+        std::fprintf(stderr, "private root/resume table incomplete\n");
+        ok = false;
+    }
 
     // Config-fed entry allowlists must produce a handling guard only at the
     // reviewed ARM/THUMB root; the default emitter remains hook-free.

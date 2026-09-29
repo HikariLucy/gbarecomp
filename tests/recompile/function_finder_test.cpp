@@ -1,8 +1,10 @@
 #include "function_finder.h"
+#include "dispatch_table_entries.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -98,6 +100,7 @@ int main() {
         kRam + 4, gbarecomp::CpuMode::Thumb, "overlapping"};
     overlapping.source_addr = kBase + kTemplate;
     overlapping.private_entry = true;
+    overlapping.dispatch_declared = true;
     relocated.add_seed(overlapping);
     relocated.add_seed({kRam + 12, gbarecomp::CpuMode::Thumb, "older_target"});
     relocated.run(32);
@@ -127,6 +130,52 @@ int main() {
         overlap_target->source_addr != kBase + kTemplate + 8) {
         std::fprintf(stderr,
                      "relocation bias did not propagate to direct branch target\n");
+        return 1;
+    }
+    for (const auto& entry :
+         gbarecomp::build_dispatch_table_entries(relocated.functions())) {
+        if (entry.addr == kRam + 4u || entry.addr == kRam + 12u) {
+            std::fprintf(stderr, "auto discovery published private RAM PC\n");
+            return 1;
+        }
+    }
+
+    // An explicit public declaration at the same placement is ambiguous.
+    gbarecomp::FunctionFinder conflicting(
+        relocated_rom.data(), relocated_rom.size(), kBase);
+    conflicting.set_speculative_literal_harvest(false);
+    auto public_claim = overlapping;
+    public_claim.private_entry = false;
+    conflicting.add_seed(public_claim);
+    conflicting.add_seed(overlapping);
+    bool rejected = false;
+    try { conflicting.run(32); }
+    catch (const std::runtime_error&) { rejected = true; }
+    if (!rejected) {
+        std::fprintf(stderr, "conflicting dispatch declarations accepted\n");
+        return 1;
+    }
+
+    // A private RAM body can BX through a literal to a public ROM body.
+    std::vector<std::uint8_t> external_rom(0x80, 0);
+    put16(external_rom, 0x20, 0x4801u); // ldr r0,[pc,#4]
+    put16(external_rom, 0x22, 0x4700u); // bx r0
+    put32(external_rom, 0x28, kBase + 0x61u);
+    put16(external_rom, 0x60, 0x4770u); // bx lr
+    gbarecomp::FunctionFinder external(
+        external_rom.data(), external_rom.size(), kBase);
+    external.set_speculative_literal_harvest(false);
+    gbarecomp::FunctionSeed private_call{
+        kRam, gbarecomp::CpuMode::Thumb, "private_call"};
+    private_call.source_addr = kBase + 0x20u;
+    private_call.private_entry = true;
+    private_call.dispatch_declared = true;
+    external.add_seed(private_call);
+    external.run(32);
+    const auto* rom_callee = find_function(
+        external, kBase + 0x60u, gbarecomp::CpuMode::Thumb);
+    if (!rom_callee || rom_callee->private_entry) {
+        std::fprintf(stderr, "public ROM callee became private\n");
         return 1;
     }
 

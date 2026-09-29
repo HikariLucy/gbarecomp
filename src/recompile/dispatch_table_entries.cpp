@@ -6,8 +6,8 @@
 
 namespace gbarecomp {
 
-std::vector<DispatchTableEntrySpec> build_dispatch_table_entries(
-    const std::vector<Function>& functions) {
+static std::vector<DispatchTableEntrySpec> build_entries(
+    const std::vector<Function>& functions, bool private_only) {
     std::vector<DispatchTableEntrySpec> entries;
     std::size_t count = functions.size();
     for (const Function& function : functions) {
@@ -17,7 +17,7 @@ std::vector<DispatchTableEntrySpec> build_dispatch_table_entries(
 
     for (std::size_t i = 0; i < functions.size(); ++i) {
         const Function& function = functions[i];
-        if (function.private_entry) continue;
+        if (function.private_entry != private_only) continue;
         const bool thumb = function.mode == CpuMode::Thumb;
         entries.push_back({function.addr, thumb, false, i});
         for (std::uint32_t addr : function.alias_entries) {
@@ -37,6 +37,16 @@ std::vector<DispatchTableEntrySpec> build_dispatch_table_entries(
             return lhs.function_index < rhs.function_index;
         });
     return entries;
+}
+
+std::vector<DispatchTableEntrySpec> build_dispatch_table_entries(
+    const std::vector<Function>& functions) {
+    return build_entries(functions, false);
+}
+
+std::vector<DispatchTableEntrySpec> build_private_dispatch_table_entries(
+    const std::vector<Function>& functions) {
+    return build_entries(functions, true);
 }
 
 }  // namespace gbarecomp

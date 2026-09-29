@@ -56,6 +56,8 @@ struct FunctionSeed {
     bool alias_candidate = false;
     // Emit a callable native body, but omit ordinary static dispatch.
     bool private_entry = false;
+    // Explicit [[extra_func]] dispatch policy, as opposed to discovery.
+    bool dispatch_declared = false;
 };
 
 // Output: one entry per discovered function.
@@ -79,6 +81,8 @@ struct Function {
     // (B/BL/conditional B). Useful for codegen labeling and for
     // verifying CFG coverage.
     std::vector<uint32_t> direct_branch_targets;
+    // Successfully decoded instruction PCs, excluding literal pools.
+    std::vector<uint32_t> instruction_addrs;
     // True if at least one indirect control transfer (BX reg,
     // LDR PC, ldm with PC, etc.) was decoded in this function.
     bool has_indirect_transfer = false;

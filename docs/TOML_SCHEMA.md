@@ -141,16 +141,28 @@ coverage).
 | `source_addr` | int hex | no       | Immutable ROM backing address for an observed relocated RAM entry. The source/runtime bias propagates through direct CFG edges, including placements that overlap a fixed `code_copy` range. |
 | `mode`        | string  | yes      | `"arm"` or `"thumb"`. Must match the actual instruction encoding at `addr`. |
 | `resume`      | bool    | no       | Default `false`. Mark an interior IRQ/SWI return PC so it is rolled into its containing function and emitted as a thin resume alias. |
-| `dispatch`    | bool    | no       | Default `true`. Set `false` to emit a callable native body without registering its root or resume aliases in the ordinary static dispatch table. A trusted caller must validate mutable RAM bytes before calling it; direct CFG descendants inherit this setting. |
+| `dispatch`    | bool    | no       | Default `true`. Set `false` to emit a callable native body with guest PCs at `addr` and opcodes at `source_addr`, without publishing its root or valid interior resume PCs in ordinary static dispatch. |
 | `name`        | string  | no       | Function name in generated C. Default: `afunc_AAAAAAAA` (ARM) or `tfunc_AAAAAAAA` (THUMB). |
 | `note`        | string  | no       | Free-form documentation. Ignored by the recompiler. |
 
 `dispatch = false` is for a native body invoked by a trusted, byte-verifying
 caller. It omits the root and generated interior resume aliases from
 `kDispatchTable`; private bodies still have interior resume labels for that
-caller. Do not combine it with `resume = true` on one entry. A private body
-that branches directly to another discovered RAM body keeps its private
-status and ROM source bias.
+caller. The generated `kPrivateDispatchTable` and
+`runtime_invoke_private_entry(pc, thumb)` are available only to an explicit
+game-owned hook. That hook must compare the **complete current RAM image**
+against its trusted source before **every** root or interior invocation.
+`runtime_dispatch` never consults the private table, and
+`runtime_has_static_entry` returns false for private PCs. A declined hook
+therefore follows the normal miss path. No generated private entry verifies
+bytes on its own.
+
+Do not combine `dispatch = false` with `resume = true` on one entry.
+Private direct CFG descendants in executable RAM retain the source/runtime
+bias; ROM callees remain public. Auto-discovered seeds at an explicit private
+PC inherit its private policy. Contradictory explicit declarations and
+private/public root or resume collisions abort generation. Interior aliases
+come from decoded instruction PCs; copied literal data has no alias.
 
 Use `resume = true` only after confirming that `addr` is an instruction inside
 an already rooted function. The alias wrapper records the requested guest PC and
