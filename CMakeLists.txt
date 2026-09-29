@@ -852,6 +852,34 @@ if(Python3_Interpreter_FOUND AND UNIX)
         DEPENDS image_scoped_cfg_runtime_tests)
 endif()
 
+if(Python3_Interpreter_FOUND AND UNIX)
+    set(CPL_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/conditional_pc_load_fixture")
+    set(CPL_GENERATED_DIR "${CPL_FIXTURE_DIR}/generated")
+    add_custom_command(
+        OUTPUT
+            "${CPL_GENERATED_DIR}/recompiled.h"
+            "${CPL_GENERATED_DIR}/recompiled_000.cpp"
+            "${CPL_GENERATED_DIR}/recompiled_001.cpp"
+            "${CPL_GENERATED_DIR}/dispatch_table.cpp"
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/conditional_pc_load/generate_fixture.py"
+            "$<TARGET_FILE:gba_recompile>"
+            "${CPL_FIXTURE_DIR}"
+        DEPENDS gba_recompile
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/conditional_pc_load/generate_fixture.py"
+        VERBATIM)
+    add_executable(conditional_pc_load_runtime_tests
+        tests/recompile/conditional_pc_load/runtime_test.cpp
+        "${CPL_GENERATED_DIR}/recompiled_000.cpp"
+        "${CPL_GENERATED_DIR}/recompiled_001.cpp"
+        "${CPL_GENERATED_DIR}/dispatch_table.cpp")
+    target_include_directories(conditional_pc_load_runtime_tests PRIVATE
+        "${CPL_GENERATED_DIR}" src/armv4t src/gba src/runtime)
+    target_link_gbarecomp_runtime_stack(conditional_pc_load_runtime_tests)
+    add_test(NAME conditional_pc_load_runtime_tests
+        COMMAND conditional_pc_load_runtime_tests "${CPL_FIXTURE_DIR}")
+endif()
+
 add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
 target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME function_finder_tests COMMAND function_finder_tests)
