@@ -2102,9 +2102,13 @@ void FunctionFinder::run(std::size_t max_functions) {
                                 s.speculative};
             // Relocation applies only while control stays in the same RAM
             // image. Calls into ROM keep their ordinary public policy.
+            const auto* src_img = image_registry_.find_image_for(fn.addr);
+            const auto* dst_img = image_registry_.find_image_for(t);
+            const bool same_secondary = src_img && dst_img &&
+                src_img == dst_img && src_img->id != "primary_rom";
             const bool same_image = fn.private_entry &&
-                t >= 0x02000000u && t < 0x04000000u &&
-                target_source != 0;
+                ((t >= 0x02000000u && t < 0x04000000u && target_source != 0) ||
+                 same_secondary);
             target.private_entry = same_image;
             if (same_image) {
                 auto existing = seed_by_key.find(k);
@@ -2117,7 +2121,9 @@ void FunctionFinder::run(std::size_t max_functions) {
                         throw std::runtime_error("ambiguous private CFG entry");
                     }
                     existing->second.private_entry = true;
-                    existing->second.source_addr = target_source;
+                    if (target_source != 0) {
+                        existing->second.source_addr = target_source;
+                    }
                 }
             }
             if (!enqueued.insert(k).second) continue;  // already queued
