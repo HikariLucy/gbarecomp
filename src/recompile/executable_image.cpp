@@ -53,6 +53,8 @@ bool ExecutableImageRegistry::add_image(const ExecutableImage& img,
     for (const auto& ex : images_) {
         const uint64_t ex_start = ex.load_address;
         const uint64_t ex_end = ex_start + ex.size;
+        // Two overlays may share guest addresses; anything else may not.
+        if (ex.overlay && img.overlay) continue;
         if (std::max(new_start, ex_start) < std::min(new_end, ex_end)) {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
@@ -84,9 +86,16 @@ bool ExecutableImageRegistry::add_image(const ExecutableImage& img,
     return true;
 }
 
+int ExecutableImageRegistry::index_of_id(const std::string& id) const {
+    for (std::size_t i = 0; i < images_.size(); ++i)
+        if (images_[i].id == id) return static_cast<int>(i);
+    return -1;
+}
+
 const ExecutableImage* ExecutableImageRegistry::find_image_for(
     uint32_t guest_pc, std::size_t* out_offset) const {
     for (const auto& img : images_) {
+        if (img.overlay) continue;
         if (guest_pc >= img.load_address &&
             (guest_pc - img.load_address) < img.size) {
             if (out_offset) {

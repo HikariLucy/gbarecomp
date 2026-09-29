@@ -133,6 +133,37 @@ int main() {
         return fail("can_read on unmapped address returned true");
     }
 
+    // 11. Overlay images: identity by index, invisible to address lookups,
+    // overlap allowed only between two overlays.
+    {
+        gbarecomp::ExecutableImageRegistry ovl;
+        std::vector<uint8_t> a(0x40, 1), b(0x40, 2), c(0x40, 3);
+        gbarecomp::ExecutableImage p;
+        p.id = "primary"; p.load_address = 0x08000000; p.size = c.size(); p.data = c.data();
+        gbarecomp::ExecutableImage oa;
+        oa.id = "oa"; oa.load_address = 0x03001000; oa.size = a.size(); oa.data = a.data();
+        oa.overlay = true;
+        gbarecomp::ExecutableImage ob = oa;
+        ob.id = "ob"; ob.data = b.data();
+        if (!ovl.add_image(p, &err) || !ovl.add_image(oa, &err))
+            return fail(("overlay add failed: " + err).c_str());
+        if (!ovl.add_image(ob, &err))
+            return fail("two overlays at one address must be accepted");
+        if (ovl.index_of_id("primary") != 0 || ovl.index_of_id("oa") != 1 ||
+            ovl.index_of_id("ob") != 2 || ovl.index_of_id("zz") != -1)
+            return fail("image index/domain mapping");
+        if (ovl.find_image_for(0x03001010) != nullptr || ovl.can_read(0x03001010, 4))
+            return fail("overlay images must not be visible to address lookups");
+        gbarecomp::ExecutableImage plain = oa;
+        plain.id = "plain"; plain.overlay = false; plain.data = c.data();
+        if (ovl.add_image(plain, &err))
+            return fail("a plain image overlapping an overlay must be rejected");
+        gbarecomp::ExecutableImage over_primary = oa;
+        over_primary.id = "op"; over_primary.load_address = 0x08000010;
+        if (ovl.add_image(over_primary, &err))
+            return fail("an overlay overlapping the primary image must be rejected");
+    }
+
     std::printf("executable_image_tests: PASS\n");
     return 0;
 }

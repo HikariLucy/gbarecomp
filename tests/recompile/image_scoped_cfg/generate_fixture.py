@@ -162,4 +162,28 @@ assert 'gf_b_root' not in public_table
 # B's data word is never emitted as code; A's code at the same address is.
 assert body.count('gf_a_f2') >= 1
 assert '0x03001020u' in private_table
+# Per-image visited scope: the same loop head 0x03001004 exists once per image,
+# with distinct image-qualified symbols, and only in the private table.
+for sym in ('gf_tfunc_img_a_03001004', 'gf_tfunc_img_b_03001004'):
+    assert sym + '(void)' in header, sym
+assert 'tfunc_03001004' not in header  # no unqualified overlay auto name
+import re
+sig = re.findall(r'void (gf_\w+)\(void\);\s+/\* 0x03001000 thumb', header)
+assert sorted(sig) == ['gf_a_root', 'gf_b_root', 'gf_pub_ram'], sig
+# Source lookup: the same guest PC is emitted from different backing bytes.
+def fn_body(name):
+    m = re.search(r'void %s\(void\) \{(.*?)\n\}\n' % name, body, re.S)
+    assert m, name
+    return m.group(1)
+assert '0x00000002u' in fn_body('gf_a_root') and '0x00000003u' in fn_body('gf_b_root')
+assert '0x00000001u' in fn_body('gf_pub_ram')
+# B's literal word (0x03001020) is data: no function is generated at that PC
+# for image B, while image A generates code there.
+assert not re.search(r'\{0x03001020u, 1u, \d+u, 2u,', private_table)
+assert re.search(r'\{0x03001020u, 1u, 0u, 1u, gf_a_f2\}', private_table)
+# Public table contains no overlay entry at all (image column only exists in
+# the private table).
+assert 'uint16_t image' in table
+# A's call into the public world goes to the public body by name.
+assert 'runtime_dispatch(_blt_' in fn_body('gf_a_f3')  # public call, by address
 print('fixture generated')

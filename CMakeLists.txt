@@ -844,6 +844,12 @@ if(Python3_Interpreter_FOUND AND UNIX)
     target_link_gbarecomp_runtime_stack(image_scoped_cfg_runtime_tests)
     add_test(NAME image_scoped_cfg_runtime_tests
         COMMAND image_scoped_cfg_runtime_tests "${ISCFG_FIXTURE_DIR}")
+    add_test(NAME image_scoped_cfg_negative_tests
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/image_scoped_cfg/negative_cases.py"
+            "$<TARGET_FILE:gba_recompile>" "${ISCFG_FIXTURE_DIR}")
+    set_tests_properties(image_scoped_cfg_negative_tests PROPERTIES
+        DEPENDS image_scoped_cfg_runtime_tests)
 endif()
 
 add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)

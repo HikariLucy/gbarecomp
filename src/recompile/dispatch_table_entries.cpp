@@ -19,9 +19,9 @@ static std::vector<DispatchTableEntrySpec> build_entries(
         const Function& function = functions[i];
         if (function.private_entry != private_only) continue;
         const bool thumb = function.mode == CpuMode::Thumb;
-        entries.push_back({function.addr, thumb, false, i});
+        entries.push_back({function.addr, thumb, false, i, function.domain});
         for (std::uint32_t addr : function.alias_entries) {
-            entries.push_back({addr, thumb, true, i});
+            entries.push_back({addr, thumb, true, i, function.domain});
         }
     }
 
@@ -29,6 +29,7 @@ static std::vector<DispatchTableEntrySpec> build_entries(
         entries.begin(), entries.end(),
         [](const DispatchTableEntrySpec& lhs,
            const DispatchTableEntrySpec& rhs) {
+            if (lhs.domain != rhs.domain) return lhs.domain < rhs.domain;
             if (lhs.addr != rhs.addr) return lhs.addr < rhs.addr;
             if (lhs.thumb != rhs.thumb) return lhs.thumb < rhs.thumb;
             // Prefer a real function root when overlapping discovery also

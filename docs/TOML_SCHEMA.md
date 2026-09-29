@@ -145,6 +145,7 @@ coverage).
 | `returns`     | bool    | no       | Default `true`. Set `false` only for a proven entry that never returns to the instruction after its caller's BL. The entry can transfer to any other guest PC and can still resume internally after an interrupt. Contradictory explicit declarations are errors. |
 | `name`        | string  | no       | Function name in generated C. Default: `afunc_AAAAAAAA` (ARM) or `tfunc_AAAAAAAA` (THUMB). |
 | `note`        | string  | no       | Free-form documentation. Ignored by the recompiler. |
+| `image`       | string  | no       | Id of a secondary `[[executable_image]]`. The function belongs to that image's CFG domain (see "Image-scoped private CFG"): its bytes come from the image at its own guest address, it is always private (requires `dispatch = false`, excludes `source_addr`), and it may share `(addr, mode)` with functions of other images. |
 
 `dispatch = false` is for a native body invoked by a trusted, byte-verifying
 caller. It omits the root and generated interior resume aliases from
@@ -265,11 +266,12 @@ miss) lets stale TOML rot.
 | `start` | int hex | yes      | First excluded byte. |
 | `end`   | int hex | yes      | One past last excluded byte (`[start, end)`). |
 | `note`  | string  | no       | Free-form documentation. |
+| `image` | string  | no       | Id of a secondary `[[executable_image]]`. The range is data only in that image's scope. Without `image` the range is global (applies to every image, the historical behaviour). |
 
 **Structural validation:**
 
 - `start < end`.
-- No overlap with any `[[extra_func]]` address.
+- No overlap with any `[[extra_func]]` address *in the same scope* (a global range applies to every scope; an image range only to functions declaring that `image`).
 - No overlap with any `[[jump_table]]`'s table bytes.
 - Ranges may overlap each other (idempotent union).
 
@@ -390,10 +392,54 @@ dispatch table and public/private namespaces.
 | `size`         | int hex | no       | Expected size in bytes. If specified, must match file size exactly. |
 | `sha256`       | string  | no       | Expected SHA-256 hash. If specified, must match file contents. |
 | `note`         | string  | no       | Documentation. |
+| `overlay`      | bool    | no       | Default `false`. An overlay image is scoped to its own identity: its address range may overlap **other overlay images** (temporary code occupying the same RAM at different times) but never the primary image or a non-overlay image, and address-based lookups never see it. Only `[[extra_func]]`/`[[data_range]]` entries naming it with `image = "<id>"` (and CFG edges that stay inside its range) read its bytes. |
 
 Address ranges of `[[executable_image]]` entries must not overlap each other
-or the primary `[program]` image. Hash and size mismatches abort discovery
-immediately before any codegen.
+or the primary `[program]` image, except between two `overlay = true` images.
+Hash and size mismatches abort discovery immediately before any codegen.
+
+### Image-scoped private CFG
+
+Function identity is `(image domain, guest address, mode)`. Domain 0 is the
+primary/public world (ROM code, `code_copy` placements, non-overlay images) and
+keeps the historical `(addr, mode)` identity. Every `overlay` image is its own
+domain (its index among the registered images). Consequences:
+
+- `visited`, non-returning keys, alias candidates and generated symbol names
+  are per domain. An overlay function with the same guest PC and mode as a
+  public function, or as a function of another overlay, is a different
+  function. Auto-generated names are image-qualified (`tfunc_<image>_<addr>`);
+  config names must be unique as before.
+- A CFG walk inside an overlay reads only that image (never a `code_copy`, a
+  public image or another overlay). A branch target inside the image's range
+  stays in the image. Any other target leaves the image and is an ordinary
+  public call. An edge is never re-targeted to another overlay just because the
+  guest addresses coincide.
+- Direct branches and fall-through into a sibling of the same overlay are
+  direct calls of that sibling's symbol. Indirect transfers (`bx rN`, `ldm ...
+  pc`, `ldr pc`) remain `runtime_dispatch`: the game's byte-verifying hook
+  re-selects the image from the live bytes, exactly as for private relocation.
+- `[[data_range]]` with `image` is evaluated only in that image's scope; global
+  ranges keep applying everywhere. `[[exclude_func]]` names public functions.
+- Overlay entries are private: they appear only in `kPrivateDispatchTable`,
+  which is qualified by image (`{addr, thumb, resume, image, fn}`).
+
+Runtime API (generated, `src/armv4t/runtime_arm.h`):
+
+| Function | Behaviour |
+|---|---|
+| `int runtime_private_image_handle(const char* id)` | `0` for the primary world (`"primary"`), the domain index for a declared image id, `-1` for an unknown id. |
+| `int runtime_invoke_private_entry_in_image(int image, uint32_t pc, int thumb)` | Runs exactly that image's private root or interior resume at `pc`/`thumb` and returns `1`. Returns `0` without executing for an unknown handle, unknown PC or wrong mode. Never falls back to another image or a public entry. |
+| `int runtime_invoke_private_entry(uint32_t pc, int thumb)` | Unscoped form, kept for existing integrations: private entries of the primary world (image 0) only. It never selects an overlay body, so it is not ambiguous. |
+
+Identity across yield/IRQ: nothing about the selected image is stored in
+runtime state. A synchronous IRQ inside an overlay body runs on the C stack and
+returns into the same body. When a body yields (`runtime_should_yield`), the
+outer loop re-dispatches the interior PC and the game's verified RAM hook
+re-selects the image from the live bytes and re-enters it through
+`runtime_invoke_private_entry_in_image` — the hook, not GBARecomp, owns image
+selection, and must re-verify before every entry. `runtime_has_static_entry`
+continues to describe public dispatch only.
 
 ## Overlay configs (`--config` more than once)
 

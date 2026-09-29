@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
     check(g_handle_a > 0 && g_handle_b > 0 && g_handle_a != g_handle_b,
           "distinct positive handles for overlay images");
     check(runtime_private_image_handle("nope") < 0, "unknown image id resolves negative");
-    check(runtime_private_image_handle("primary_rom") == 0, "primary is handle 0");
+    check(runtime_private_image_handle("primary") == 0, "primary is handle 0");
 
     // ---- public dispatch never selects an overlay ----------------------
     check(runtime_has_static_entry(0x03001000u, 1), "public 0x03001000 entry present");
@@ -127,6 +127,9 @@ int main(int argc, char** argv) {
         check(runtime_invoke_private_entry_in_image(g_handle_a, 0x03001000u, 1) == 1, "invoke A");
     });
     check(g_cpu.R[0] == 2u && g_cpu.R[5] == 0x1Eu && g_cpu.R[1] == 3u, "A body effects");
+    // Overlay code reads its literals from live RAM; the game's byte gate is
+    // what guarantees the RAM holds this image (see verified_hook below).
+    load_ram(bus, g_img_b);
     run_callee([&] {
         check(runtime_invoke_private_entry_in_image(g_handle_b, 0x03001000u, 1) == 1, "invoke B");
     });
@@ -150,6 +153,7 @@ int main(int argc, char** argv) {
 
     // ---- interior resume aliases are per image --------------------------
     for (int who = 0; who < 2; ++who) {
+        load_ram(bus, who ? g_img_b : g_img_a);
         run_callee([&] {
             g_cpu.R[0] = 0x77u;
             check(runtime_invoke_private_entry_in_image(who ? g_handle_b : g_handle_a,

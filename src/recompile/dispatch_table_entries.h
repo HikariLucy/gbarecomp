@@ -13,6 +13,8 @@ struct DispatchTableEntrySpec {
     bool thumb;
     bool resume;
     std::size_t function_index;
+    // Image identity of the owning function (0 = public/primary world).
+    std::uint16_t domain = 0;
 };
 
 // Flatten function roots and resume aliases into the global ordering required

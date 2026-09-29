@@ -32,17 +32,29 @@ namespace gbarecomp {
 
 namespace {
 
-uint64_t visit_key(uint32_t addr, CpuMode mode) {
-    return (static_cast<uint64_t>(addr) << 1) |
+// Function identity: (image domain, guest address, mode). Domain 0 keeps the
+// historical (addr << 1 | mode) value.
+uint64_t visit_key(uint32_t addr, CpuMode mode, uint16_t domain = 0) {
+    return (static_cast<uint64_t>(domain) << 33) |
+           (static_cast<uint64_t>(addr) << 1) |
            static_cast<uint64_t>(mode);
 }
 
-std::string default_name(uint32_t addr, CpuMode mode) {
+std::string default_name(uint32_t addr, CpuMode mode,
+                         const std::string& image_id = std::string()) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%s_%08X",
                   mode == CpuMode::Thumb ? "tfunc" : "afunc",
                   addr);
-    return std::string(buf);
+    if (image_id.empty()) return std::string(buf);
+    // Overlay functions share guest addresses with other images; qualify the
+    // default name with the (stable, config-declared) image id.
+    std::string tag;
+    for (char ch : image_id)
+        tag.push_back(((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= 'a' && ch <= 'z')) ? ch : '_');
+    return std::string(mode == CpuMode::Thumb ? "tfunc_" : "afunc_") + tag +
+           "_" + (std::string(buf).substr(6));
 }
 
 uint32_t ror32(uint32_t v, unsigned n) {
@@ -91,16 +103,14 @@ bool FunctionFinder::add_executable_image(const ExecutableImage& image,
 
 void FunctionFinder::add_seed(const FunctionSeed& seed) {
     if (seed.alias_candidate) {
-        uint64_t key = (static_cast<uint64_t>(seed.addr) << 1) |
-                       (seed.mode == CpuMode::Thumb ? 1u : 0u);
-        alias_candidate_keys_.insert(key);
+        alias_candidate_keys_.insert(visit_key(seed.addr, seed.mode, seed.domain));
     }
     seeds_.push_back(seed);
 }
 
 void FunctionFinder::add_data_range(uint32_t start, uint32_t end,
-                                     const std::string& note) {
-    data_ranges_.push_back(DataRange{start, end, note});
+                                     const std::string& note, int domain) {
+    data_ranges_.push_back(DataRange{start, end, note, domain});
 }
 
 void FunctionFinder::add_code_copy(uint32_t runtime_start,
@@ -119,6 +129,12 @@ void FunctionFinder::add_exclude(uint32_t addr,
 
 bool FunctionFinder::map_addr_to_source(uint32_t addr,
                                          uint32_t* source) const {
+    // Inside the running walk's overlay image the image's own bytes win: no
+    // code_copy or public image may reinterpret an overlay address.
+    if (domain_image(addr)) {
+        *source = addr;
+        return true;
+    }
     // Explicit fixed mappings take precedence even when their runtime address
     // lies in the nominal ROM window. Matrix Memory movie carts power on with
     // physical 0x00000200..0x000011FF paged over virtual
@@ -144,21 +160,29 @@ bool FunctionFinder::map_addr_to_source(uint32_t addr,
 bool FunctionFinder::can_read_at(uint32_t addr, uint32_t len) const {
     uint32_t source = 0;
     if (!map_addr_to_source(addr, &source)) return false;
+    if (const auto* img = domain_image(source)) {
+        return (source - img->load_address) + len <= img->size;
+    }
     return image_registry_.can_read(source, len);
 }
 
-bool FunctionFinder::addr_in_data_range(uint32_t addr) const {
-    for (const auto& dr : data_ranges_) {
-        if (addr >= dr.start && addr < dr.end) return true;
-    }
-    return false;
-}
-
+// A data_range applies to `addr` when it is global (domain -1) or scoped to
+// the domain that owns `addr` in the running walk: the overlay image when the
+// address lies inside it, otherwise the public domain 0. An overlay's data
+// therefore never marks another image's code as non-executable.
 const DataRange* FunctionFinder::find_data_range(uint32_t addr) const {
+    const int owner = domain_image(addr) ? static_cast<int>(current_domain_) : 0;
     for (const auto& dr : data_ranges_) {
-        if (addr >= dr.start && addr < dr.end) return &dr;
+        if (addr >= dr.start && addr < dr.end &&
+            (dr.domain < 0 || dr.domain == owner)) {
+            return &dr;
+        }
     }
     return nullptr;
+}
+
+bool FunctionFinder::addr_in_data_range(uint32_t addr) const {
+    return find_data_range(addr) != nullptr;
 }
 
 void FunctionFinder::record_collision(uint32_t target,
@@ -191,7 +215,9 @@ uint32_t FunctionFinder::read_u32(uint32_t addr) const {
     uint32_t source = addr;
     map_addr_to_source(addr, &source);
     std::size_t off = 0;
-    const auto* img = image_registry_.find_image_for(source, &off);
+    const auto* img = domain_image(source);
+    if (img) off = source - img->load_address;
+    else img = image_registry_.find_image_for(source, &off);
     if (!img || off + 4 > img->size) return 0;
     return  static_cast<uint32_t>(img->data[off])
          | (static_cast<uint32_t>(img->data[off + 1]) << 8)
@@ -208,7 +234,9 @@ uint16_t FunctionFinder::read_u16(uint32_t addr) const {
     uint32_t source = addr;
     map_addr_to_source(addr, &source);
     std::size_t off = 0;
-    const auto* img = image_registry_.find_image_for(source, &off);
+    const auto* img = domain_image(source);
+    if (img) off = source - img->load_address;
+    else img = image_registry_.find_image_for(source, &off);
     if (!img || off + 2 > img->size) return 0;
     return  static_cast<uint16_t>(img->data[off])
          | (static_cast<uint16_t>(img->data[off + 1]) << 8);
@@ -448,18 +476,38 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                                    const std::string& seed_name,
                                    uint32_t seed_source_addr,
                                    bool private_entry,
-                                   bool speculative) {
-    uint32_t entry_source = 0;
-    if (seed_source_addr != 0) {
-        entry_source = seed_source_addr;
-        if (!addr_in_rom(entry_source)) return;
-    } else if (!map_addr_to_source(entry_addr, &entry_source)) {
-        return;
-    }
+                                   bool speculative,
+                                   uint16_t domain) {
+    // Scope every helper that reads bytes, tests data ranges or derives a key
+    // to this walk's image; restored on every exit path.
+    struct DomainScope {
+        uint16_t& slot;
+        uint16_t saved;
+        DomainScope(uint16_t& s, uint16_t d) : slot(s), saved(s) { slot = d; }
+        ~DomainScope() { slot = saved; }
+    } domain_scope(current_domain_, domain);
 
+    uint32_t entry_source = 0;
+    const ExecutableImage* entry_img = nullptr;
     std::size_t entry_off = 0;
-    const auto* entry_img = image_registry_.find_image_for(entry_source, &entry_off);
-    if (!entry_img) return;
+    if (domain != 0) {
+        // Overlay image: the seed's bytes come from that image at its own
+        // guest address. Never a code_copy, never a public image.
+        entry_img = domain_image(entry_addr);
+        if (!entry_img) return;
+        entry_source = entry_addr;
+        entry_off = entry_addr - entry_img->load_address;
+        private_entry = true;
+    } else {
+        if (seed_source_addr != 0) {
+            entry_source = seed_source_addr;
+            if (!addr_in_rom(entry_source)) return;
+        } else if (!map_addr_to_source(entry_addr, &entry_source)) {
+            return;
+        }
+        entry_img = image_registry_.find_image_for(entry_source, &entry_off);
+        if (!entry_img) return;
+    }
 
     // An explicit source address describes one observed placement of a
     // position-independent ROM routine in RAM. Fixed code_copy ranges may
@@ -508,7 +556,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 addr < 0x04000000u)
             ? read_walk_u32(addr) : read_u32(addr);
     };
-    uint64_t key = visit_key(entry_addr, entry_mode);
+    uint64_t key = visit_key(entry_addr, entry_mode, domain);
     if (visited_.find(key) != visited_.end()) return;
 
     // Speculative (literal-pool) walks downgrade data_range collisions
@@ -522,8 +570,12 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
     fn.private_entry = private_entry;
     fn.returns = nonreturn_keys_.count(key) == 0;
     fn.mode = entry_mode;
-    fn.name = seed_name.empty() ? default_name(entry_addr, entry_mode)
-                                : seed_name;
+    fn.domain = domain;
+    fn.name = seed_name.empty()
+        ? default_name(entry_addr, entry_mode,
+                       domain ? image_registry_.images()[domain].id
+                              : std::string())
+        : seed_name;
     fn.end_addr = entry_addr;  // updated below
 
     visited_[key] = functions_.size();  // index will be re-sorted at end
@@ -812,8 +864,11 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         } else {
             // Propagate speculation: a cross-mode target reached from a
             // speculative (literal-pool) walk is itself speculative.
-            mode_switch_seeds_.push_back(
-                FunctionSeed{target, target_mode, "", 0, speculative});
+            {
+                FunctionSeed ms{target, target_mode, "", 0, speculative};
+                ms.domain = target_domain(target);
+                mode_switch_seeds_.push_back(std::move(ms));
+            }
         }
         ++stats_.branch_targets_discovered;
     };
@@ -916,8 +971,11 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         // ARM gets the extra entry-prologue gate; THUMB's signal suffices.
         if (tmode == CpuMode::Arm && !is_arm_func_prologue(tgt)) return;
         ++stats_.literal_pool_seeds_kept;
-        literal_pool_seeds_.push_back(
-            FunctionSeed{tgt, tmode, "", 0, /*speculative=*/true});
+        {
+            FunctionSeed ls{tgt, tmode, "", 0, /*speculative=*/true};
+            ls.domain = target_domain(tgt);
+            literal_pool_seeds_.push_back(std::move(ls));
+        }
     };
 
     // Recognize an abs32 jump table at `base` revealed by an indexed load
@@ -975,7 +1033,11 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             }
             if (tgt == 0 || !looks_like_code(tgt, tmode, /*strict=*/!bounded))
                 break;
-            targets.push_back(FunctionSeed{tgt, tmode, ""});
+            {
+                FunctionSeed jt{tgt, tmode, ""};
+                jt.domain = target_domain(tgt);
+                targets.push_back(std::move(jt));
+            }
         }
 
         const bool ok = bounded
@@ -1228,7 +1290,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 // half's intermediate target, which is not the call
                 // target and can point into data for long BLs.
                 uint32_t return_pc = pc + 4u;
-                if (nonreturn_keys_.count(visit_key(full, entry_mode))) {
+                if (nonreturn_keys_.count(visit_key(full, entry_mode, target_domain(full)))) {
                     nonreturn_thumb_suffixes.insert(pc + 2u);
                 } else if (can_read_at(return_pc, 2)) {
                     enqueue_resolved_target(return_pc, entry_mode, "branch");
@@ -1863,7 +1925,8 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         const bool nonreturn_arm_call =
             ins.op == armv4t::IrOp::BL &&
             ins.cond == armv4t::Cond::AL &&
-            nonreturn_keys_.count(visit_key(ins.branch_target, entry_mode));
+            nonreturn_keys_.count(visit_key(ins.branch_target, entry_mode,
+                                            target_domain(ins.branch_target)));
         if (soft_reset || nonreturn_arm_call ||
             nonreturn_thumb_suffixes.count(ins.pc) != 0) break;
 
@@ -1934,7 +1997,7 @@ void FunctionFinder::run(std::size_t max_functions) {
     std::unordered_map<uint64_t, bool> explicit_returns;
     for (const auto& seed : seeds_) {
         if (!seed.returns_declared) continue;
-        const auto key = visit_key(seed.addr, seed.mode);
+        const auto key = visit_key(seed.addr, seed.mode, seed.domain);
         const auto prior = explicit_returns.find(key);
         if (prior != explicit_returns.end() && prior->second != seed.returns)
             throw std::runtime_error("conflicting explicit returns policy");
@@ -1944,7 +2007,7 @@ void FunctionFinder::run(std::size_t max_functions) {
     const std::size_t manual_seed_count = seeds_.size();
     std::unordered_set<uint64_t> manual_seed_keys;
     for (const auto& s : seeds_)
-        manual_seed_keys.insert(visit_key(s.addr, s.mode));
+        manual_seed_keys.insert(visit_key(s.addr, s.mode, s.domain));
     std::vector<FunctionSeed> code_copy_seeds = collect_code_copy_seeds();
     stats_.aot_code_copy_seeds = code_copy_seeds.size();
     seeds_.insert(seeds_.end(),
@@ -1955,9 +2018,11 @@ void FunctionFinder::run(std::size_t max_functions) {
     // is contradicting themselves; or a jump_table expanded onto
     // bytes that another data_range marked as "not code").
     for (const auto& s : seeds_) {
+        current_domain_ = s.domain;
         if (addr_in_data_range(s.addr)) {
             record_collision(s.addr, 0, s.name, "seed");
         }
+        current_domain_ = 0;
     }
 
     // Snapshot seed (addr, mode) keys so we can later compute the
@@ -1965,7 +2030,7 @@ void FunctionFinder::run(std::size_t max_functions) {
     std::unordered_set<uint64_t> seed_keys;
     std::unordered_map<uint64_t, FunctionSeed> seed_by_key;
     for (const auto& s : seeds_) {
-        uint64_t k = visit_key(s.addr, s.mode);
+        uint64_t k = visit_key(s.addr, s.mode, s.domain);
         seed_keys.insert(k);
         auto prior = seed_by_key.find(k);
         if (s.dispatch_declared && prior != seed_by_key.end() &&
@@ -2021,7 +2086,7 @@ void FunctionFinder::run(std::size_t max_functions) {
     // Both → "redundant_manual".
     std::unordered_map<uint64_t, uint8_t> origin_mask;  // 1=seed, 2=walk
     for (std::size_t i = 0; i < seeds_.size(); ++i) {
-        origin_mask[visit_key(seeds_[i].addr, seeds_[i].mode)] |=
+        origin_mask[visit_key(seeds_[i].addr, seeds_[i].mode, seeds_[i].domain)] |=
             (i < manual_seed_count) ? 1u : 2u;
     }
 
@@ -2047,7 +2112,7 @@ void FunctionFinder::run(std::size_t max_functions) {
         }
 
         FunctionSeed s = queued.seed;
-        uint64_t s_key = visit_key(s.addr, s.mode);
+        uint64_t s_key = visit_key(s.addr, s.mode, s.domain);
         auto seed_it = seed_by_key.find(s_key);
         bool current_required =
             queued.required || manual_seed_keys.count(s_key) != 0;
@@ -2070,7 +2135,7 @@ void FunctionFinder::run(std::size_t max_functions) {
 
         std::size_t before = functions_.size();
         discover_one(s.addr, s.mode, s.name, s.source_addr,
-                     s.private_entry, s.speculative);
+                     s.private_entry, s.speculative, s.domain);
         if (functions_.size() == before) continue;
 
         // The function we just added is at the end of functions_.
@@ -2081,14 +2146,26 @@ void FunctionFinder::run(std::size_t max_functions) {
         // mode (control flow within a function doesn't switch
         // ARM/THUMB without a BX, which is indirect).
         for (uint32_t t : fn.direct_branch_targets) {
-            uint64_t k = visit_key(t, fn.mode);
+            // A target inside the function's own overlay image stays in that
+            // image's domain; anything else leaves the image and is an
+            // ordinary public (domain 0) call/branch.
+            uint16_t td = 0;
+            if (fn.domain != 0) {
+                const auto& imgs = image_registry_.images();
+                if (fn.domain < imgs.size() &&
+                    t >= imgs[fn.domain].load_address &&
+                    t - imgs[fn.domain].load_address < imgs[fn.domain].size) {
+                    td = fn.domain;
+                }
+            }
+            uint64_t k = visit_key(t, fn.mode, td);
             // Mark walk-origin. If this address was ALSO a seed,
             // it now has both bits set (redundant_manual).
             origin_mask[k] |= 2u;
             // Propagate speculation: a branch target reached only from a
             // speculative (literal-pool) walk is itself speculative.
             uint32_t target_source = 0;
-            if (fn.source_addr != fn.addr) {
+            if (td == 0 && fn.source_addr != fn.addr) {
                 const int64_t delta = static_cast<int64_t>(t) -
                     static_cast<int64_t>(fn.addr);
                 const int64_t mapped = static_cast<int64_t>(fn.source_addr) +
@@ -2100,15 +2177,16 @@ void FunctionFinder::run(std::size_t max_functions) {
             }
             FunctionSeed target{t, fn.mode, "", target_source,
                                 s.speculative};
+            target.domain = td;
             // Relocation applies only while control stays in the same RAM
             // image. Calls into ROM keep their ordinary public policy.
             const auto* src_img = image_registry_.find_image_for(fn.addr);
             const auto* dst_img = image_registry_.find_image_for(t);
-            const bool same_secondary = src_img && dst_img &&
+            const bool same_secondary = td == 0 && src_img && dst_img &&
                 src_img == dst_img && src_img->id != "primary_rom";
-            const bool same_image = fn.private_entry &&
+            const bool same_image = td != 0 || (fn.private_entry &&
                 ((t >= 0x02000000u && t < 0x04000000u && target_source != 0) ||
-                 same_secondary);
+                 same_secondary));
             target.private_entry = same_image;
             if (same_image) {
                 auto existing = seed_by_key.find(k);
@@ -2137,7 +2215,7 @@ void FunctionFinder::run(std::size_t max_functions) {
         // function's walk (BX Rm to a tracked-constant THUMB
         // target from ARM code, and vice versa).
         for (const auto& ms : mode_switch_seeds_) {
-            uint64_t k = visit_key(ms.addr, ms.mode);
+            uint64_t k = visit_key(ms.addr, ms.mode, ms.domain);
             origin_mask[k] |= 2u;
             if (!enqueued.insert(k).second) continue;  // already queued
             discovered_seeds.push_back(QueuedSeed{ms, current_required});
@@ -2152,7 +2230,7 @@ void FunctionFinder::run(std::size_t max_functions) {
         // against anything already discovered, so a literal that points
         // at a known function is harmlessly dropped here.
         for (const auto& ls : literal_pool_seeds_) {
-            uint64_t k = visit_key(ls.addr, ls.mode);
+            uint64_t k = visit_key(ls.addr, ls.mode, ls.domain);
             origin_mask[k] |= 2u;
             if (!enqueued.insert(k).second) continue;  // already queued
             discovered_seeds.push_back(QueuedSeed{ls, current_required});
@@ -2164,7 +2242,7 @@ void FunctionFinder::run(std::size_t max_functions) {
         // Drain address-taken functions from pointer tables whose base was
         // itself loaded by this reachable walk.
         for (const auto& as : aot_pointer_seeds_) {
-            uint64_t k = visit_key(as.addr, as.mode);
+            uint64_t k = visit_key(as.addr, as.mode, as.domain);
             origin_mask[k] |= 2u;
             if (!enqueued.insert(k).second) continue;
             discovered_seeds.push_back(QueuedSeed{as, current_required});
@@ -2181,7 +2259,7 @@ void FunctionFinder::run(std::size_t max_functions) {
         // If THIS function came from a seed (not a walk), it was
         // discovered "as a seed", but the function's body still
         // counts toward "walked from here" for its branches.
-        uint64_t this_key = visit_key(fn.addr, fn.mode);
+        uint64_t this_key = visit_key(fn.addr, fn.mode, fn.domain);
         if (seed_keys.count(this_key) == 0) {
             // It came from a walk (a branch target reached during
             // a prior function's discovery).
@@ -2195,7 +2273,8 @@ void FunctionFinder::run(std::size_t max_functions) {
         std::size_t before = functions_.size();
         auto last = std::remove_if(functions_.begin(), functions_.end(),
             [&](const Function& fn) {
-                return excluded_.count(fn.addr) > 0;
+                // exclude_func names a public (domain 0) function.
+                return fn.domain == 0 && excluded_.count(fn.addr) > 0;
             });
         functions_.erase(last, functions_.end());
         stats_.excluded_count = before - functions_.size();
@@ -2205,14 +2284,14 @@ void FunctionFinder::run(std::size_t max_functions) {
     std::sort(functions_.begin(), functions_.end(),
               [](const Function& a, const Function& b) {
                   if (a.addr != b.addr) return a.addr < b.addr;
-                  return a.mode < b.mode;
+                  if (a.mode != b.mode) return a.mode < b.mode;
+                  return a.domain < b.domain;
               });
 
     auto is_alias_candidate = [&](const Function& f) -> bool {
         if (alias_candidate_keys_.empty()) return false;
-        uint64_t k = (static_cast<uint64_t>(f.addr) << 1) |
-                     (f.mode == CpuMode::Thumb ? 1u : 0u);
-        return alias_candidate_keys_.count(k) != 0;
+        return alias_candidate_keys_.count(
+                   visit_key(f.addr, f.mode, f.domain)) != 0;
     };
 
     auto source_bias = [](const Function& f) -> int64_t {
@@ -2231,6 +2310,7 @@ void FunctionFinder::run(std::size_t max_functions) {
         if (is_alias_candidate(functions_[i])) continue;  // extent unused
         for (std::size_t j = i + 1; j < functions_.size(); ++j) {
             if (functions_[j].mode != functions_[i].mode) continue;
+            if (functions_[j].domain != functions_[i].domain) continue;
             // Overlapping RAM placements of the same immutable routine are
             // separate static CFGs. A function from another placement must
             // not truncate this one's emitted body merely because its runtime
@@ -2270,7 +2350,8 @@ void FunctionFinder::run(std::size_t max_functions) {
             for (std::size_t j = 0; j < functions_.size(); ++j) {
                 if (j == i) continue;
                 const Function& h = functions_[j];
-                if (is_alias_candidate(h) || h.mode != c.mode) continue;
+                if (is_alias_candidate(h) || h.mode != c.mode ||
+                    h.domain != c.domain) continue;
                 if (source_bias(h) != source_bias(c)) continue;
                 if (h.addr < c.addr && c.addr < h.end_addr) {
                     if (best == SIZE_MAX ||
@@ -2341,7 +2422,7 @@ void FunctionFinder::run(std::size_t max_functions) {
     // Walk-source breakdown for emitted functions only.
     // origin_mask: 1=seed, 2=walk, 3=both.
     for (const auto& fn : functions_) {
-        uint8_t mask = origin_mask[visit_key(fn.addr, fn.mode)];
+        uint8_t mask = origin_mask[visit_key(fn.addr, fn.mode, fn.domain)];
         switch (mask) {
             case 1:
                 ++stats_.manual_seeds_only;

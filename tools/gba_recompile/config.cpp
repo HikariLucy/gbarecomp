@@ -144,6 +144,19 @@ bool parse_extra_funcs(const toml::array& arr,
         e.note = get_string_field(*t, "note", false, ok, err);
         e.resume = (*t)["resume"].value_or(false);
         e.private_entry = !(*t)["dispatch"].value_or(true);
+        e.image = get_string_field(*t, "image", false, ok, err);
+        if (!ok) {
+            std::fprintf(stderr, "%s[[extra_func]] entry %zu: %s\n",
+                         kAbortHeader, i, err.c_str());
+            return false;
+        }
+        if (!e.image.empty() && !e.private_entry) {
+            std::fprintf(stderr,
+                "%s[[extra_func]] entry %zu: image = \"%s\" requires "
+                "dispatch = false (overlay-image functions are private)\n",
+                kAbortHeader, i, e.image.c_str());
+            return false;
+        }
         auto returns_node = (*t)["returns"];
         if (returns_node) {
             if (!returns_node.is_boolean()) {
@@ -349,6 +362,12 @@ bool parse_data_ranges(const toml::array& arr,
             return false;
         }
         r.note = get_string_field(*t, "note", false, ok, err);
+        r.image = get_string_field(*t, "image", false, ok, err);
+        if (!ok) {
+            std::fprintf(stderr, "%s[[data_range]] entry %zu: %s\n",
+                         kAbortHeader, i, err.c_str());
+            return false;
+        }
         out.push_back(std::move(r));
     }
     return true;
@@ -527,6 +546,7 @@ bool parse_executable_images(const toml::array& arr,
         img.size = get_u32_field(*t, "size", false, ok, err);
         img.sha256 = get_string_field(*t, "sha256", false, ok, err);
         img.note = get_string_field(*t, "note", false, ok, err);
+        img.overlay = (*t)["overlay"].value_or(false);
         out.push_back(std::move(img));
     }
     return true;
@@ -589,7 +609,8 @@ bool validate_cross_section(const Config& cfg) {
                 std::fprintf(stderr, "%sduplicate [[executable_image]] id '%s'\n", kAbortHeader, a.id.c_str());
                 return false;
             }
-            if (a.size > 0 && b.size > 0) {
+            // Two overlay images may share guest addresses.
+            if (a.size > 0 && b.size > 0 && !(a.overlay && b.overlay)) {
                 uint64_t a_start = a.load_address, a_end = a_start + a.size;
                 uint64_t b_start = b.load_address, b_end = b_start + b.size;
                 if (std::max(a_start, b_start) < std::min(a_end, b_end)) {
@@ -613,7 +634,7 @@ bool validate_cross_section(const Config& cfg) {
     // exclude_func + extra_func at the same addr is contradictory.
     for (const auto& ex : cfg.exclude_funcs) {
         for (const auto& ef : cfg.extra_funcs) {
-            if (ef.addr == ex.addr) {
+            if (ef.addr == ex.addr && ef.image.empty()) {
                 std::fprintf(stderr,
                     "%saddress 0x%08X is declared in BOTH "
                     "[[extra_func]] and [[exclude_func]] — "
@@ -626,6 +647,9 @@ bool validate_cross_section(const Config& cfg) {
     // extra_func addr inside a data_range is also contradictory.
     for (const auto& ef : cfg.extra_funcs) {
         for (const auto& dr : cfg.data_ranges) {
+            // A data_range only contradicts a function in its own scope:
+            // global ranges apply everywhere, image ranges only to that image.
+            if (!dr.image.empty() && dr.image != ef.image) continue;
             if (ef.addr >= dr.start && ef.addr < dr.end) {
                 std::fprintf(stderr,
                     "%s[[extra_func]] at 0x%08X falls inside "
@@ -1010,7 +1034,8 @@ bool load_config_overlay(const std::string& path, Config& base) {
     for (auto& ef : ov.extra_funcs) {
         bool skip = false;
         for (auto& have : base.extra_funcs) {
-            if (have.addr == ef.addr && have.mode == ef.mode) {
+            if (have.addr == ef.addr && have.mode == ef.mode &&
+                have.image == ef.image) {
                 if (have.returns_declared && ef.returns_declared &&
                     have.returns != ef.returns) {
                     std::fprintf(stderr,
@@ -1029,7 +1054,7 @@ bool load_config_overlay(const std::string& path, Config& base) {
         }
         if (skip) continue;
         for (const auto& ex : base.exclude_funcs) {
-            if (ex.addr == ef.addr) {
+            if (ex.addr == ef.addr && ef.image.empty()) {
                 // The base deliberately excluded this address. Warn rather
                 // than abort: the overlay is generated, the exclusion was
                 // reviewed, and validate_cross_section would otherwise turn
@@ -1045,6 +1070,7 @@ bool load_config_overlay(const std::string& path, Config& base) {
         }
         if (skip) continue;
         for (const auto& dr : base.data_ranges) {
+            if (!dr.image.empty() && dr.image != ef.image) continue;
             if (ef.addr >= dr.start && ef.addr < dr.end) {
                 std::fprintf(stderr,
                     "warn: overlay [[extra_func]] 0x%08X (%s) dropped — the "
@@ -1068,7 +1094,8 @@ bool load_config_overlay(const std::string& path, Config& base) {
     for (auto& dr : ov.data_ranges) {
         bool dup = false;
         for (const auto& have : base.data_ranges) {
-            if (have.start == dr.start && have.end == dr.end) { dup = true; break; }
+            if (have.start == dr.start && have.end == dr.end &&
+                have.image == dr.image) { dup = true; break; }
         }
         if (dup) { ++dropped_other; continue; }
         base.data_ranges.push_back(std::move(dr));
@@ -1100,7 +1127,9 @@ bool load_config_overlay(const std::string& path, Config& base) {
     for (auto& img : ov.executable_images) {
         bool dup = false;
         for (const auto& have : base.executable_images) {
-            if (have.id == img.id || have.load_address == img.load_address) { dup = true; break; }
+            if (have.id == img.id ||
+                (have.load_address == img.load_address &&
+                 !(have.overlay && img.overlay))) { dup = true; break; }
         }
         if (dup) { ++dropped_other; continue; }
         base.executable_images.push_back(std::move(img));

@@ -176,9 +176,24 @@ void runtime_force_interp_step(void);
 // no reliable stop address (a top-level / exception-return miss).
 int runtime_has_static_entry(uint32_t pc, int thumb);
 
-// Explicit game-owned entry point. Caller must verify the complete mutable
-// RAM image before each invocation. Generated cart output supplies this
-// function; ordinary runtime_dispatch never calls it.
+// Explicit game-owned entry points. Caller must verify the complete mutable
+// RAM image before each invocation. Generated cart output supplies these
+// functions; ordinary runtime_dispatch never calls them.
+//
+// Private entries are qualified by image identity, because several images
+// (overlays) may define a body at the same guest PC and mode.
+//
+// runtime_private_image_handle: handle of a config-declared
+// [[executable_image]] id (0 = the primary world, -1 = unknown id).
+int runtime_private_image_handle(const char* id);
+// Fail-closed: runs the private entry (root or interior resume) of exactly
+// this image at this PC and mode, returning 1; returns 0 without executing
+// anything for an unknown handle, an unknown PC or a wrong mode. It never
+// falls back to another image or to a public entry.
+int runtime_invoke_private_entry_in_image(int image, uint32_t pc, int thumb);
+// Unscoped form: private entries of the primary world (image 0) only, e.g.
+// [[extra_func]] dispatch=false with an ordinary source_addr placement. It
+// never selects an overlay-image body.
 int runtime_invoke_private_entry(uint32_t pc, int thumb);
 
 // The interpret-the-missed-subtree core of the on-miss bridge, factored so the

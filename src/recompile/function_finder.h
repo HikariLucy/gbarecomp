@@ -64,6 +64,14 @@ struct FunctionSeed {
     // instruction following its caller's BL. It may transfer elsewhere.
     bool returns = true;
     bool returns_declared = false;
+    // Image identity (CFG domain): index of the executable image whose bytes
+    // back this seed. 0 is the primary/public world (ordinary ROM code and
+    // code_copy placements) and keeps the historical (addr, mode) identity.
+    // A non-zero domain names a secondary image: the seed is always private,
+    // reads only that image, and its CFG stays inside the image's address
+    // range. Two seeds with the same guest address and mode but different
+    // domains are unrelated functions.
+    uint16_t domain = 0;
 };
 
 // Output: one entry per discovered function.
@@ -105,6 +113,9 @@ struct Function {
     bool is_alias = false;
     bool private_entry = false;
     bool returns = true;
+    // Image identity (see FunctionSeed::domain). Together with (addr, mode)
+    // this is the function's identity; `addr` remains the guest execution PC.
+    uint16_t domain = 0;
 };
 
 // A jump table the finder recognized automatically (no [[jump_table]]
@@ -165,6 +176,9 @@ struct DataRange {
     uint32_t    start;
     uint32_t    end;        // [start, end)
     std::string note;
+    // -1: global (applies to every domain, the historical behaviour).
+    // >= 0: applies only to CFG walks in that image domain.
+    int         domain = -1;
 };
 
 struct CodeCopyRange {
@@ -201,6 +215,10 @@ public:
     const ExecutableImageRegistry& image_registry() const {
         return image_registry_;
     }
+    // Domain (image identity) for an executable image id; -1 if unknown.
+    int image_domain(const std::string& id) const {
+        return image_registry_.index_of_id(id);
+    }
 
     // Add a seed. Duplicate addresses are tolerated; the first
     // seed's mode + name wins.
@@ -212,7 +230,7 @@ public:
     // [[data_range]] entries or "jump_table" for auto-excluded
     // jump-table bytes.
     void add_data_range(uint32_t start, uint32_t end,
-                         const std::string& note);
+                         const std::string& note, int domain = -1);
 
     void add_code_copy(uint32_t runtime_start, uint32_t source_start,
                        uint32_t size, const std::string& note);
@@ -277,7 +295,7 @@ private:
     std::vector<FunctionSeed> seeds_;
     std::unordered_set<uint64_t> nonreturn_keys_;
     std::vector<Function>     functions_;
-    std::unordered_map<uint64_t, std::size_t> visited_;  // key=(addr<<1)|mode
+    std::unordered_map<uint64_t, std::size_t> visited_;  // key=(domain,addr,mode)
     // Keys (addr<<1|mode) of explicit interior/resume seeds — candidates for
     // mid-function alias roll-up. See FunctionSeed::alias_candidate.
     std::unordered_set<uint64_t> alias_candidate_keys_;
@@ -323,8 +341,26 @@ private:
     uint32_t aot_scan_start_ = 0;
     uint32_t aot_scan_end_ = 0;
 
+    // Image domain of the walk currently running (0 outside discover_one).
+    // Every byte read, data_range test and key derived while it is non-zero
+    // is resolved inside that image; addresses outside the image belong to
+    // the public domain 0 (calls out of an overlay).
+    uint16_t current_domain_ = 0;
+    const ExecutableImage* domain_image(uint32_t addr) const {
+        if (current_domain_ == 0) return nullptr;
+        const auto& images = image_registry_.images();
+        if (current_domain_ >= images.size()) return nullptr;
+        const auto& img = images[current_domain_];
+        return (addr >= img.load_address &&
+                addr - img.load_address < img.size) ? &img : nullptr;
+    }
+    // Domain a CFG target belongs to when reached from the current walk.
+    uint16_t target_domain(uint32_t addr) const {
+        return domain_image(addr) ? current_domain_ : uint16_t{0};
+    }
     bool addr_in_rom(uint32_t addr) const {
-        return image_registry_.find_image_for(addr) != nullptr;
+        return domain_image(addr) != nullptr ||
+               image_registry_.find_image_for(addr) != nullptr;
     }
     bool map_addr_to_source(uint32_t addr, uint32_t* source) const;
     bool can_read_at(uint32_t addr, uint32_t len) const;
@@ -346,7 +382,8 @@ private:
                       const std::string& name,
                       uint32_t source_addr = 0,
                       bool private_entry = false,
-                      bool speculative = false);
+                      bool speculative = false,
+                      uint16_t domain = 0);
 
     // Set at the top of each discover_one from its `speculative` arg.
     // When a speculative walk would record a data_range collision,

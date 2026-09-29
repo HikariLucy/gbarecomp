@@ -558,7 +558,8 @@ void write_header(const std::string& dir,
 
 void write_dispatch_table(const std::string& dir,
                            const std::vector<Function>& funcs,
-    const OutputNames& names) {
+    const OutputNames& names,
+    const std::vector<std::string>& image_ids = {}) {
     std::string path = dir + "/" + names.dispatch;
     std::string temp = path + ".tmp";
     std::FILE* f = std::fopen(temp.c_str(), "wb");
@@ -592,32 +593,72 @@ void write_dispatch_table(const std::string& dir,
     if (names.table_symbol == "kDispatchTable") {
         const auto private_entries =
             gbarecomp::build_private_dispatch_table_entries(funcs);
+        // Image identities (domain index -> stable config id). Domain 0 is the
+        // primary/public world (ROM code_copy placements); its private entries
+        // are the historical unscoped ones.
+        std::size_t domain_count = 1;
+        for (const auto& fn : funcs)
+            domain_count = std::max<std::size_t>(domain_count, fn.domain + 1u);
         std::fprintf(f,
             "\n// Explicit, byte-verified game hooks only. Ordinary dispatch "
             "never reads this table.\n"
-            "extern \"C\" const DispatchEntry kPrivateDispatchTable[] = {\n");
+            "// Entries are qualified by image identity: the same guest PC may "
+            "exist in several images.\n"
+            "struct PrivateDispatchEntry { uint32_t addr; uint8_t thumb; "
+            "uint8_t resume; uint16_t image; void (*fn)(void); };\n"
+            "extern \"C\" const PrivateDispatchEntry kPrivateDispatchTable[] = {\n");
         for (const auto& entry : private_entries) {
             const auto& fn = funcs[entry.function_index];
-            std::fprintf(f, "    {0x%08Xu, %uu, %uu, %s},\n",
+            std::fprintf(f, "    {0x%08Xu, %uu, %uu, %uu, %s},\n",
                          entry.addr, entry.thumb ? 1u : 0u,
-                         entry.resume ? 1u : 0u, fn.name.c_str());
+                         entry.resume ? 1u : 0u,
+                         static_cast<unsigned>(entry.domain), fn.name.c_str());
         }
         std::fprintf(f,
             "};\nextern \"C\" const unsigned kPrivateDispatchTableLen "
-            "= %zu;\n"
+            "= %zu;\n", private_entries.size());
+        std::fprintf(f, "static const char* const kPrivateImageIds[] = {\n");
+        for (std::size_t d = 0; d < domain_count; ++d) {
+            const std::string id = d < image_ids.size() ? image_ids[d]
+                                                        : std::string();
+            std::fprintf(f, "    \"%s\",\n", id.c_str());
+        }
+        std::fprintf(f,
+            "};\n"
+            "static const unsigned kPrivateImageCount = %zu;\n"
             "extern \"C\" uint32_t g_runtime_resume_pc;\n"
-            "extern \"C\" int runtime_invoke_private_entry(uint32_t pc, "
-            "int thumb) {\n"
+            "// Handle of an image id: 0 for the primary world, its domain index\n"
+            "// for an overlay image, -1 for an unknown id.\n"
+            "extern \"C\" int runtime_private_image_handle(const char* id) {\n"
+            "    if (!id) return -1;\n"
+            "    for (unsigned i = 0; i < kPrivateImageCount; ++i) {\n"
+            "        const char* c = kPrivateImageIds[i];\n"
+            "        unsigned j = 0;\n"
+            "        while (c[j] && c[j] == id[j]) ++j;\n"
+            "        if (c[j] == 0 && id[j] == 0) return static_cast<int>(i);\n"
+            "    }\n"
+            "    return -1;\n"
+            "}\n"
+            "// Fail-closed: only an entry of exactly this image, PC and mode runs.\n"
+            "extern \"C\" int runtime_invoke_private_entry_in_image(int image, "
+            "uint32_t pc, int thumb) {\n"
+            "    if (image < 0 || static_cast<unsigned>(image) >= kPrivateImageCount) "
+            "return 0;\n"
             "    for (unsigned i = 0; i < kPrivateDispatchTableLen; ++i) {\n"
             "        const auto& e = kPrivateDispatchTable[i];\n"
-            "        if (e.addr != (pc & ~1u) || e.thumb != (thumb != 0)) "
-            "continue;\n"
+            "        if (e.image != static_cast<unsigned>(image) ||\n"
+            "            e.addr != (pc & ~1u) || e.thumb != (thumb != 0)) continue;\n"
             "        g_runtime_resume_pc = e.resume ? e.addr : 0u;\n"
             "        e.fn();\n"
             "        return 1;\n"
             "    }\n"
             "    return 0;\n"
-            "}\n", private_entries.size());
+            "}\n"
+            "// Unscoped API: private entries of the primary world only (image 0).\n"
+            "// It never selects an overlay image body.\n"
+            "extern \"C\" int runtime_invoke_private_entry(uint32_t pc, int thumb) {\n"
+            "    return runtime_invoke_private_entry_in_image(0, pc, thumb);\n"
+            "}\n", domain_count);
     }
     std::fclose(f);
     commit_generated_file(temp, path);
@@ -763,6 +804,7 @@ void write_data_symbol_map(const std::string& dir,
 uint64_t stable_shard_hash(const Function& fn) {
     uint64_t x = (static_cast<uint64_t>(fn.addr) << 1u) |
         (fn.mode == CpuMode::Thumb ? 1u : 0u);
+    x |= static_cast<uint64_t>(fn.domain) << 33u;
     x ^= x >> 30u;
     x *= 0xBF58476D1CE4E5B9ull;
     x ^= x >> 27u;
@@ -816,13 +858,48 @@ void write_body(const std::string& dir,
                     alu_immediate_override_pcs,
                 const std::unordered_set<uint64_t>* mod_function_hook_keys,
                 const ExecutableImageRegistry* image_registry = nullptr) {
-    std::unordered_map<uint64_t, std::string> name_by_key;
-    std::unordered_set<uint64_t> nonreturn_target_keys;
-    for (const auto& fn : funcs) {
-        uint64_t key = (static_cast<uint64_t>(fn.addr) << 1u) |
+    // Direct B/BL targets resolve through a per-domain view: a body in image
+    // domain D sees D's own functions inside D's address range and the public
+    // (domain 0) functions everywhere else. A public body only sees domain 0.
+    // No lookup ever crosses images merely because a guest address matches.
+    std::size_t domain_count = 1;
+    for (const auto& fn : funcs)
+        domain_count = std::max<std::size_t>(domain_count, fn.domain + 1u);
+    std::vector<std::unordered_map<uint64_t, std::string>> name_by_key(domain_count);
+    std::vector<std::unordered_set<uint64_t>> nonreturn_target_keys(domain_count);
+    auto guest_key = [](const Function& fn) {
+        return (static_cast<uint64_t>(fn.addr) << 1u) |
             (fn.mode == CpuMode::Thumb ? 1u : 0u);
-        name_by_key[key] = fn.name;
-        if (!fn.returns) nonreturn_target_keys.insert(key);
+    };
+    for (const auto& fn : funcs) {
+        if (fn.domain != 0) continue;
+        name_by_key[0][guest_key(fn)] = fn.name;
+        if (!fn.returns) nonreturn_target_keys[0].insert(guest_key(fn));
+    }
+    for (std::size_t d = 1; d < domain_count; ++d) {
+        name_by_key[d] = name_by_key[0];
+        nonreturn_target_keys[d] = nonreturn_target_keys[0];
+        if (image_registry && d < image_registry->images().size()) {
+            const auto& img = image_registry->images()[d];
+            const uint64_t lo = img.load_address;
+            const uint64_t hi = lo + img.size;
+            for (auto it = name_by_key[d].begin(); it != name_by_key[d].end();) {
+                const uint64_t addr = it->first >> 1u;
+                if (addr >= lo && addr < hi) it = name_by_key[d].erase(it);
+                else ++it;
+            }
+            for (auto it = nonreturn_target_keys[d].begin();
+                 it != nonreturn_target_keys[d].end();) {
+                const uint64_t addr = *it >> 1u;
+                if (addr >= lo && addr < hi) it = nonreturn_target_keys[d].erase(it);
+                else ++it;
+            }
+        }
+        for (const auto& fn : funcs) {
+            if (fn.domain != d) continue;
+            name_by_key[d][guest_key(fn)] = fn.name;
+            if (!fn.returns) nonreturn_target_keys[d].insert(guest_key(fn));
+        }
     }
 
     const std::string body_name = names.body;
@@ -880,10 +957,11 @@ void write_body(const std::string& dir,
             fn.direct_branch_targets.size(),
             fn.has_indirect_transfer ? "  indirect" : "",
             fn.name.c_str());
-        emit_function_body(f, fn, rom, rom_size, rom_base, name_by_key,
+        emit_function_body(f, fn, rom, rom_size, rom_base,
+                           name_by_key[fn.domain],
                            alu_immediate_override_pcs,
                            mod_function_hook_keys,
-                           &nonreturn_target_keys,
+                           &nonreturn_target_keys[fn.domain],
                            image_registry);
         std::fprintf(f, "}\n\n");
         }
@@ -937,6 +1015,7 @@ bool validate_thumb_alu_immediate_override_sites(
     for (const auto& entry : cfg.thumb_alu_immediate_overrides) {
         const Function* owner = nullptr;
         for (const auto& fn : funcs) {
+            if (fn.domain != 0) continue;
             if (fn.mode == CpuMode::Thumb && entry.addr >= fn.addr &&
                 entry.addr < fn.end_addr) {
                 owner = &fn;
@@ -1003,6 +1082,7 @@ bool validate_alu_immediate_override_sites(
     for (const auto& entry : cfg.alu_immediate_overrides) {
         const Function* owner = nullptr;
         for (const auto& fn : funcs) {
+            if (fn.domain != 0) continue;
             const uint32_t step = fn.mode == CpuMode::Thumb ? 2u : 4u;
             if (entry.addr >= fn.addr && entry.addr < fn.end_addr &&
                 (entry.addr % step) == 0) {
@@ -1063,7 +1143,8 @@ bool audit_mod_function_hooks(const Config& cfg,
             (hook.mode == CpuMode::Thumb ? 1u : 0u);
         const auto found = std::find_if(funcs.begin(), funcs.end(),
             [&](const Function& fn) {
-                return fn.addr == hook.addr && fn.mode == hook.mode;
+                return fn.domain == 0 && fn.addr == hook.addr &&
+                       fn.mode == hook.mode;
             });
         if (found == funcs.end()) {
             std::fprintf(stderr,
@@ -1153,6 +1234,8 @@ int main(int argc, char** argv) {
     std::size_t jump_table_expanded_seeds = 0;
     if (have_cfg) {
         for (const auto& dr : cfg.data_ranges) {
+            // Image-scoped ranges are added below, once images are registered.
+            if (!dr.image.empty()) continue;
             finder.add_data_range(dr.start, dr.end, dr.note);
         }
         for (const auto& cc : cfg.code_copies) {
@@ -1277,6 +1360,7 @@ int main(int argc, char** argv) {
             img.path = resolved_path.string();
             img.sha256 = img_cfg.sha256;
             img.note = img_cfg.note;
+            img.overlay = img_cfg.overlay;
 
             std::string reg_err;
             if (!finder.add_executable_image(img, &reg_err)) {
@@ -1284,11 +1368,46 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        // Resolve an image id to its finder domain (index in the registry).
+        auto resolve_image = [&](const std::string& id, const char* what,
+                                 uint32_t addr, int* domain) -> bool {
+            const int d = finder.image_domain(id);
+            if (d <= 0) {
+                std::fprintf(stderr,
+                    "error: %s at 0x%08X names image '%s', which is %s\n",
+                    what, addr, id.c_str(),
+                    d == 0 ? "the primary image (only secondary "
+                             "[[executable_image]] ids are valid)"
+                           : "not a declared [[executable_image]]");
+                return false;
+            }
+            *domain = d;
+            return true;
+        };
+        for (const auto& dr : cfg.data_ranges) {
+            if (dr.image.empty()) continue;
+            int domain = 0;
+            if (!resolve_image(dr.image, "[[data_range]]", dr.start, &domain))
+                return 1;
+            finder.add_data_range(dr.start, dr.end, dr.note, domain);
+        }
         for (const auto& ef : cfg.extra_funcs) {
             FunctionSeed seed{ef.addr, ef.mode, ef.name};
+            if (!ef.image.empty()) {
+                int domain = 0;
+                if (!resolve_image(ef.image, "[[extra_func]]", ef.addr, &domain))
+                    return 1;
+                if (ef.source_addr != 0) {
+                    std::fprintf(stderr,
+                        "error: [[extra_func]] at 0x%08X: image and source_addr "
+                        "are mutually exclusive\n", ef.addr);
+                    return 1;
+                }
+                seed.domain = static_cast<uint16_t>(domain);
+            }
             seed.source_addr = ef.source_addr;
             seed.alias_candidate = ef.resume;  // interior/resume seed -> alias
-            seed.private_entry = ef.private_entry;
+            seed.private_entry = ef.private_entry || seed.domain != 0;
             seed.dispatch_declared = true;
             seed.returns = ef.returns;
             seed.returns_declared = ef.returns_declared;
@@ -1518,7 +1637,10 @@ int main(int argc, char** argv) {
         for (const auto& e : public_entries)
             public_keys.insert((static_cast<uint64_t>(e.addr) << 1) | e.thumb);
         for (const auto& e : private_entries) {
-            if (public_keys.count((static_cast<uint64_t>(e.addr) << 1) |
+            // Overlay images (domain > 0) legitimately share guest addresses
+            // with public entries; only primary-world privates must not.
+            if (e.domain == 0 &&
+                public_keys.count((static_cast<uint64_t>(e.addr) << 1) |
                                   e.thumb)) {
                 std::fprintf(stderr,
                     "private/public dispatch collision at 0x%08X (%s)\n",
@@ -1589,7 +1711,10 @@ int main(int argc, char** argv) {
                mod_function_hook_keys.empty()
                    ? nullptr : &mod_function_hook_keys,
                &finder.image_registry());
-    write_dispatch_table(cli.out_dir, emit_funcs, names);
+    std::vector<std::string> image_ids;
+    for (const auto& image : finder.image_registry().images())
+        image_ids.push_back(image.id);
+    write_dispatch_table(cli.out_dir, emit_funcs, names, image_ids);
     std::printf("==> wrote %s/{%s, %s%s, %s}\n",
                 cli.out_dir.c_str(),
                 names.header.c_str(),

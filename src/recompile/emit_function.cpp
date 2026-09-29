@@ -202,7 +202,12 @@ std::string emit_function_body_str(
     const uint32_t fn_source_addr = fn.source_addr ? fn.source_addr : fn.addr;
     if (image_registry) {
         std::size_t off = 0;
-        const auto* img = image_registry->find_image_for(fn_source_addr, &off);
+        // An overlay function is backed by its own image, never by whichever
+        // image happens to cover the same guest address.
+        const auto* img = fn.domain != 0 &&
+                fn.domain < image_registry->images().size()
+            ? &image_registry->images()[fn.domain]
+            : image_registry->find_image_for(fn_source_addr, &off);
         if (img) {
             rom = img->data;
             rom_size = img->size;
@@ -606,6 +611,24 @@ std::string emit_function_body_str(
     // the exec loop with PC unchanged and re-dispatch the same
     // function forever. The trailing dispatch hands control to the
     // adjacent function via the dispatch table.
+    // An overlay-image body may share guest addresses with other images, so
+    // an address-only runtime_dispatch could reach the wrong image's body.
+    // Fall-through into a sibling of the SAME image is a direct call instead
+    // (the finder's per-image name map resolves it). Domain 0 is unchanged.
+    if (fn.domain != 0) {
+        const auto sibling = func_names_by_key.find(
+            (static_cast<uint64_t>(fn.end_addr) << 1u) |
+            (fn.mode == CpuMode::Thumb ? 1u : 0u));
+        if (sibling != func_names_by_key.end()) {
+            appendf(out,
+                "    /* fall-through to 0x%08X (same image) */\n"
+                "    g_cpu.R[15] = 0x%08Xu;\n"
+                "    %s();\n"
+                "    return;\n",
+                fn.end_addr, fn.end_addr, sibling->second.c_str());
+            return out;
+        }
+    }
     appendf(out,
         "    /* fall-through to 0x%08X */\n"
         "    g_cpu.R[15] = 0x%08Xu;\n"

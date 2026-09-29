@@ -80,6 +80,10 @@ struct ConfigExtraFunc {
     bool        private_entry = false;
     bool        returns = true;
     bool        returns_declared = false;
+    // Optional secondary [[executable_image]] id. The function belongs to that
+    // image's CFG domain: bytes come from the image, the entry is private,
+    // and it may share (addr, mode) with functions of other images.
+    std::string image;
 };
 
 // An explicitly reviewed interruptible host span. Every aligned instruction
@@ -117,6 +121,9 @@ struct ConfigDataRange {
     uint32_t    start = 0;
     uint32_t    end = 0;    // [start, end)
     std::string note;
+    // Optional secondary [[executable_image]] id: the range is data only in
+    // that image's scope. Empty = global (historical behaviour).
+    std::string image;
 };
 
 struct ConfigCodeCopy {
@@ -144,6 +151,9 @@ struct ConfigExecutableImage {
     uint32_t    size = 0;
     std::string sha256;
     std::string note;
+    // Overlay image: scoped to its own identity and allowed to overlap other
+    // overlay images' guest addresses (never the primary or plain images).
+    bool        overlay = false;
 };
 
 struct ConfigExcludeFunc {
