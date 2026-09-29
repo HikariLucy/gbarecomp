@@ -610,6 +610,7 @@ bool obj_texel_opaque(const uint8_t* vram,
 void mark_obj_window_scanline(bool* mask,
                               uint32_t y,
                               uint16_t dispcnt,
+                              const uint8_t* io,
                               const uint8_t* vram,
                               const uint8_t* oam,
                               uint32_t kScreenWidth,
@@ -620,6 +621,9 @@ void mark_obj_window_scanline(bool* mask,
     uint32_t bg_mode = dispcnt & 0x07u;
     constexpr uint32_t obj_tile_base = 0x10000u;
     bool obj_1d_mapping = (dispcnt & 0x0040u) != 0;
+    const uint16_t mosaic = load_u16_le(&io[0x4C]);
+    const int mosaic_h = static_cast<int>(((mosaic >> 8) & 0xFu) + 1u);
+    const int mosaic_v = static_cast<int>(((mosaic >> 12) & 0xFu) + 1u);
 
     for (int idx = 127; idx >= 0; --idx) {
         const uint8_t* entry = oam + idx * 8;
@@ -645,18 +649,23 @@ void mark_obj_window_scanline(bool* mask,
         if (sx & 0x100) sx -= 0x200;
 
         bool color256 = (attr0 & 0x2000u) != 0;
+        const bool mosaicked = (attr0 & 0x1000u) != 0;
+        const int source_y = mosaicked
+            ? static_cast<int>(y) - static_cast<int>(y) % mosaic_v
+            : static_cast<int>(y);
         uint32_t tile_num = attr2 & 0x3FFu;
         // Bitmap BGs consume the lower half of OBJ VRAM. Hardware preserves
         // the normal tile-number origin and ignores tiles 0..511 rather than
         // rebasing tile 0 to 0x14000.
         if (bg_mode >= 3 && tile_num < 512u) continue;
         int tiles_w = sw / 8;
-        int tiles_h = sh / 8;
 
         if (rot_scale) {
             int bw = disable_or_double ? sw * 2 : sw;
             int bh = disable_or_double ? sh * 2 : sh;
-            int j = static_cast<int>(y) - sy;
+            const int destination_j = static_cast<int>(y) - sy;
+            if (destination_j < 0 || destination_j >= bh) continue;
+            int j = source_y - sy;
             if (j < 0 || j >= bh) continue;
 
             int affine_group = (attr1 >> 9) & 0x1Fu;
@@ -674,7 +683,9 @@ void mark_obj_window_scanline(bool* mask,
             for (int i = 0; i < bw; ++i) {
                 int screen_x = sx + i;
                 if (screen_x < 0 || screen_x >= static_cast<int>(kScreenWidth)) continue;
-                int dx = i - half_bw;
+                const int source_x = mosaicked
+                    ? screen_x - screen_x % mosaic_h : screen_x;
+                int dx = source_x - sx - half_bw;
                 int tex_x = ((pa * dx + pb * dy) >> 8) + half_sw;
                 int tex_y = ((pc * dx + pd * dy) >> 8) + half_sh;
                 if (tex_x < 0 || tex_x >= sw) continue;
@@ -688,27 +699,23 @@ void mark_obj_window_scanline(bool* mask,
             continue;
         }
 
-        int line = static_cast<int>(y) - sy;
-        if (line < 0 || line >= sh) continue;
-        bool hflip = (attr1 & 0x1000u) != 0;
-        bool vflip = (attr1 & 0x2000u) != 0;
-        int ty = line >> 3;
-        int py = line & 7;
-        int src_ty = vflip ? (tiles_h - 1 - ty) : ty;
-        int src_py = vflip ? (7 - py) : py;
-        for (int tx = 0; tx < tiles_w; ++tx) {
-            int src_tx = hflip ? (tiles_w - 1 - tx) : tx;
-            for (int px = 0; px < 8; ++px) {
-                int screen_x = sx + tx * 8 + px;
-                if (screen_x < 0 || screen_x >= static_cast<int>(kScreenWidth)) continue;
-                int src_px = hflip ? (7 - px) : px;
-                int tex_x = src_tx * 8 + src_px;
-                int tex_y = src_ty * 8 + src_py;
-                if (obj_texel_opaque(vram, obj_tile_base, obj_1d_mapping,
-                                     tile_num, tiles_w, color256,
-                                     tex_x, tex_y)) {
-                    mask[screen_x] = true;
-                }
+        const int destination_line = static_cast<int>(y) - sy;
+        if (destination_line < 0 || destination_line >= sh) continue;
+        const int source_line = source_y - sy;
+        if (source_line < 0 || source_line >= sh) continue;
+        const bool hflip = (attr1 & 0x1000u) != 0;
+        const bool vflip = (attr1 & 0x2000u) != 0;
+        const int tex_y = vflip ? sh - 1 - source_line : source_line;
+        for (int screen_x = sx; screen_x < sx + sw; ++screen_x) {
+            if (screen_x < 0 || screen_x >= static_cast<int>(kScreenWidth)) continue;
+            const int source_x = mosaicked
+                ? screen_x - screen_x % mosaic_h : screen_x;
+            const int local_x = source_x - sx;
+            if (local_x < 0 || local_x >= sw) continue;
+            const int tex_x = hflip ? sw - 1 - local_x : local_x;
+            if (obj_texel_opaque(vram, obj_tile_base, obj_1d_mapping,
+                                 tile_num, tiles_w, color256, tex_x, tex_y)) {
+                mask[screen_x] = true;
             }
         }
     }
@@ -774,7 +781,7 @@ void render_scanline_internal(uint8_t* rgb,
     bool obj_window_storage[GbaPpu::kScreenWidth] = {};
     bool* obj_window_mask = nullptr;
     if (objwin_en) {
-        mark_obj_window_scanline(obj_window_storage, y, dispcnt, vram, oam,
+        mark_obj_window_scanline(obj_window_storage, y, dispcnt, io, vram, oam,
                                  kScreenWidth, kScreenHeight);
         obj_window_mask = obj_window_storage;
     }
@@ -795,6 +802,11 @@ void render_scanline_internal(uint8_t* rgb,
 
     uint16_t bldcnt = static_cast<uint16_t>(io[0x50] | (io[0x51] << 8));
     uint16_t bldalpha = static_cast<uint16_t>(io[0x52] | (io[0x53] << 8));
+    const uint16_t mosaic = load_u16_le(&io[0x4C]);
+    const uint32_t bg_mosaic_h = (mosaic & 0x000Fu) + 1u;
+    const uint32_t bg_mosaic_v = ((mosaic >> 4) & 0x000Fu) + 1u;
+    const int obj_mosaic_h = static_cast<int>(((mosaic >> 8) & 0x000Fu) + 1u);
+    const int obj_mosaic_v = static_cast<int>(((mosaic >> 12) & 0x000Fu) + 1u);
     uint32_t first_targets = bldcnt & 0x3Fu;
     uint32_t second_targets = (bldcnt >> 8) & 0x3Fu;
     uint32_t effect = (bldcnt >> 6) & 0x3u;
@@ -867,11 +879,14 @@ void render_scanline_internal(uint8_t* rgb,
         uint32_t width_px = width_tiles * 8u;
         uint32_t height_px = height_tiles * 8u;
         uint32_t block_cols = width_tiles / 32u;
+        const bool mosaicked = (bgcnt & 0x0040u) != 0;
+        const uint32_t source_y = mosaicked ? y - y % bg_mosaic_v : y;
 
         for (uint32_t x = 0; x < kScreenWidth; ++x) {
             if (!layer_enabled(x, layer)) continue;
-            uint32_t tex_x = (x + hofs) & (width_px - 1u);
-            uint32_t tex_y = (y + vofs) & (height_px - 1u);
+            const uint32_t source_x = mosaicked ? x - x % bg_mosaic_h : x;
+            uint32_t tex_x = (source_x + hofs) & (width_px - 1u);
+            uint32_t tex_y = (source_y + vofs) & (height_px - 1u);
             uint32_t tile_x = tex_x >> 3;
             uint32_t tile_y = tex_y >> 3;
             uint32_t block = (tile_x >> 5) + (tile_y >> 5) * block_cols;
@@ -949,9 +964,16 @@ void render_scanline_internal(uint8_t* rgb,
         int32_t refy = read_s28_ref(io, param_off + 0x0C);
         int32_t xt = refx + static_cast<int32_t>(y) * pb;
         int32_t yt = refy + static_cast<int32_t>(y) * pd;
+        const bool mosaicked = (bgcnt & 0x0040u) != 0;
+        const int32_t source_y = static_cast<int32_t>(
+            mosaicked ? y - y % bg_mosaic_v : y);
         for (uint32_t x = 0; x < kScreenWidth; ++x) {
-            int32_t tex_x = xt >> 8;
-            int32_t tex_y = yt >> 8;
+            const int32_t source_x = static_cast<int32_t>(
+                mosaicked ? x - x % bg_mosaic_h : x);
+            int32_t tex_x = mosaicked
+                ? (refx + source_y * pb + source_x * pa) >> 8 : xt >> 8;
+            int32_t tex_y = mosaicked
+                ? (refy + source_y * pd + source_x * pc) >> 8 : yt >> 8;
             xt += pa;
             yt += pc;
             if (!layer_enabled(x, layer)) continue;
@@ -1017,9 +1039,16 @@ void render_scanline_internal(uint8_t* rgb,
         int32_t refy = read_s28_ref(io, 0x2C);
         int32_t xt = refx + static_cast<int32_t>(y) * pb;
         int32_t yt = refy + static_cast<int32_t>(y) * pd;
+        const bool mosaicked = (bgcnt & 0x0040u) != 0;
+        const int32_t source_y = static_cast<int32_t>(
+            mosaicked ? y - y % bg_mosaic_v : y);
         for (uint32_t x = 0; x < kScreenWidth; ++x) {
-            int32_t tex_x = xt >> 8;
-            int32_t tex_y = yt >> 8;
+            const int32_t source_x = static_cast<int32_t>(
+                mosaicked ? x - x % bg_mosaic_h : x);
+            int32_t tex_x = mosaicked
+                ? (refx + source_y * pb + source_x * pa) >> 8 : xt >> 8;
+            int32_t tex_y = mosaicked
+                ? (refy + source_y * pd + source_x * pc) >> 8 : yt >> 8;
             xt += pa;
             yt += pc;
             if (!layer_enabled(x, layer)) continue;
@@ -1167,6 +1196,10 @@ void render_scanline_internal(uint8_t* rgb,
             if (sy >= 160) sy -= 256;
             if (sx & 0x100) sx -= 0x200;
             bool color256 = (attr0 & 0x2000u) != 0;
+            const bool mosaicked = (attr0 & 0x1000u) != 0;
+            const int source_y = mosaicked
+                ? static_cast<int>(y) - static_cast<int>(y) % obj_mosaic_v
+                : static_cast<int>(y);
             uint32_t tile_num = attr2 & 0x3FFu;
             if (bg_mode >= 3 && tile_num < 512u) continue;
             uint32_t palette_bank = (attr2 >> 12) & 0xFu;
@@ -1225,7 +1258,9 @@ void render_scanline_internal(uint8_t* rgb,
                 if (apply_foreign_obj_focus(&sx, &sy, bw, bh, tile_num,
                                             false, static_cast<uint32_t>(idx)).action ==
                     ForeignObjFocusAction::kSuppress) continue;
-                int j = static_cast<int>(y) - sy;
+                const int destination_j = static_cast<int>(y) - sy;
+                if (destination_j < 0 || destination_j >= bh) continue;
+                int j = source_y - sy;
                 if (j < 0 || j >= bh) continue;
                 int affine_group = (attr1 >> 9) & 0x1Fu;
                 const uint8_t* ag = oam + affine_group * 0x20u;
@@ -1239,12 +1274,16 @@ void render_scanline_internal(uint8_t* rgb,
                 int half_sh = sh >> 1;
                 int dy = j - half_bh;
                 for (int i = 0; i < bw; ++i) {
-                    int dx = i - half_bw;
+                    const int screen_x = sx + i;
+                    if (screen_x < 0 || screen_x >= static_cast<int>(kScreenWidth)) continue;
+                    const int source_x = mosaicked
+                        ? screen_x - screen_x % obj_mosaic_h : screen_x;
+                    int dx = source_x - sx - half_bw;
                     int tex_x = ((pa * dx + pb * dy) >> 8) + half_sw;
                     int tex_y = ((pc * dx + pd * dy) >> 8) + half_sh;
                     if (tex_x < 0 || tex_x >= sw) continue;
                     if (tex_y < 0 || tex_y >= sh) continue;
-                    emit_obj(tex_x, tex_y, sx + i);
+                    emit_obj(tex_x, tex_y, screen_x);
                 }
                 continue;
             }
@@ -1254,22 +1293,30 @@ void render_scanline_internal(uint8_t* rgb,
             if (focus_result.action == ForeignObjFocusAction::kSuppress) continue;
             const int draw_w = scaled_extent(sw, focus_result.scale_q8_8);
             const int draw_h = scaled_extent(sh, focus_result.scale_q8_8);
-            int line = static_cast<int>(y) - sy;
+            const int destination_line = static_cast<int>(y) - sy;
+            if (destination_line < 0 || destination_line >= draw_h) continue;
+            const int line = source_y - sy;
             if (line < 0 || line >= draw_h) continue;
             bool hflip = (attr1 & 0x1000u) != 0;
             bool vflip = (attr1 & 0x2000u) != 0;
-            const int source_y = nearest_source_pixel(line, sh, draw_h);
-            int ty = source_y >> 3;
-            int py = source_y & 7;
+            const int texture_y = nearest_source_pixel(line, sh, draw_h);
+            int ty = texture_y >> 3;
+            int py = texture_y & 7;
             int src_ty = vflip ? (tiles_h - 1 - ty) : ty;
             int src_py = vflip ? (7 - py) : py;
             for (int dx = 0; dx < draw_w; ++dx) {
-                const int source_x = nearest_source_pixel(dx, sw, draw_w);
-                const int tx = source_x >> 3;
+                const int screen_x = sx + dx;
+                if (screen_x < 0 || screen_x >= static_cast<int>(kScreenWidth)) continue;
+                const int origin_x = mosaicked
+                    ? screen_x - screen_x % obj_mosaic_h : screen_x;
+                const int origin_dx = origin_x - sx;
+                if (origin_dx < 0 || origin_dx >= draw_w) continue;
+                const int texture_x = nearest_source_pixel(origin_dx, sw, draw_w);
+                const int tx = texture_x >> 3;
                 int src_tx = hflip ? (tiles_w - 1 - tx) : tx;
-                const int px = source_x & 7;
+                const int px = texture_x & 7;
                 int src_px = hflip ? (7 - px) : px;
-                emit_obj(src_tx * 8 + src_px, src_ty * 8 + src_py, sx + dx);
+                emit_obj(src_tx * 8 + src_px, src_ty * 8 + src_py, screen_x);
             }
         }
     }
@@ -1370,7 +1417,7 @@ void render_scanline_wide(uint8_t* rgb, int y, uint16_t dispcnt,
     bool obj_window_storage[GbaPpu::kScreenWidth] = {};
     bool* obj_window_mask = nullptr;
     if (objwin_en && native_row) {
-        mark_obj_window_scanline(obj_window_storage, y, dispcnt, vram, oam,
+        mark_obj_window_scanline(obj_window_storage, y, dispcnt, io, vram, oam,
                                  kVanW, kVanH);
         obj_window_mask = obj_window_storage;
     }
