@@ -863,6 +863,17 @@ target_include_directories(ppu_smoke_tests PRIVATE src/runtime src/debug)
 target_link_libraries(ppu_smoke_tests PRIVATE gbarecomp_gba)
 gbarecomp_target_link_host_stack(ppu_smoke_tests PRIVATE)
 add_test(NAME ppu_smoke_tests COMMAND ppu_smoke_tests)
+add_executable(mosaic_ppu_tests tests/mosaic/test_main.cpp)
+target_include_directories(mosaic_ppu_tests PRIVATE src/runtime src/debug)
+target_link_libraries(mosaic_ppu_tests PRIVATE gbarecomp_gba)
+gbarecomp_target_link_host_stack(mosaic_ppu_tests PRIVATE)
+foreach(mosaic_case IN ITEMS
+    bg_horizontal bg_vertical bg_disabled
+    obj_horizontal obj_vertical obj_disabled
+    size_one mixed_sizes affine_bg obj_hflip obj_affine bitmap_bg
+    obj_window blend_after_mosaic)
+    add_test(NAME mosaic_${mosaic_case} COMMAND mosaic_ppu_tests ${mosaic_case})
+endforeach()
 
 add_executable(save_config_tests
     tests/runtime/save_config_test.cpp
