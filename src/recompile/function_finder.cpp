@@ -1390,8 +1390,13 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                     enqueue_resolved_target(raw, tgt_mode, "branch");
                 }
             }
-            if (ins.op == armv4t::IrOp::BX &&
-                ins.rm != 14 &&
+            // A manual-link indirect call: LR was set to a known continuation
+            // (`add lr,pc,#k` / `mov lr,pc`) and control leaves through `bx rN`
+            // or `ldr pc,[...]` (e.g. an opcode/callback table). The callee
+            // returns to the continuation via LR, so it is a real entry that
+            // no BL will ever reveal.
+            if (((ins.op == armv4t::IrOp::BX && ins.rm != 14) ||
+                 (ins.op == armv4t::IrOp::LDR && ins.rd == 15)) &&
                 reg_const[14].known) {
                 uint32_t raw = reg_const[14].value;
                 CpuMode return_mode = (raw & 1u)
