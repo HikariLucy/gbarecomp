@@ -870,7 +870,9 @@ extern "C" void runtime_dispatch(uint32_t target_pc) {
         runtime_bridge_interpret(pc, thumb, 0u, 0u);
         return;
     }
-    if (pc >= 0x02000000u && pc < 0x04000000u && g_runtime_ram_dispatch_hook &&
+    const bool is_ram = (pc >= 0x02000000u && pc < 0x04000000u) ||
+                        (pc >= 0x06000000u && pc < 0x07000000u);
+    if (is_ram && g_runtime_ram_dispatch_hook &&
         (!g_resumable_context || !g_resumable_context->ram_dispatch_filter ||
          g_resumable_context->ram_dispatch_filter(pc, thumb ? 1 : 0))) {
         if (g_resumable_context && g_resumable_context->ram_dispatch_boundary)
