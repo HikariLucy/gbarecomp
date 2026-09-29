@@ -27,6 +27,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "executable_image.h"
+
 namespace gbarecomp {
 
 enum class CpuMode : uint8_t {
@@ -193,6 +195,13 @@ public:
     FunctionFinder(const uint8_t* rom_bytes, std::size_t rom_size,
                    uint32_t rom_base);
 
+    // Register an immutable secondary executable image.
+    bool add_executable_image(const ExecutableImage& image,
+                              std::string* error = nullptr);
+    const ExecutableImageRegistry& image_registry() const {
+        return image_registry_;
+    }
+
     // Add a seed. Duplicate addresses are tolerated; the first
     // seed's mode + name wins.
     void add_seed(const FunctionSeed& seed);
@@ -264,6 +273,7 @@ private:
     std::size_t    rom_size_;
     uint32_t       rom_base_;
 
+    ExecutableImageRegistry image_registry_;
     std::vector<FunctionSeed> seeds_;
     std::unordered_set<uint64_t> nonreturn_keys_;
     std::vector<Function>     functions_;
@@ -314,8 +324,7 @@ private:
     uint32_t aot_scan_end_ = 0;
 
     bool addr_in_rom(uint32_t addr) const {
-        return addr >= rom_base_ &&
-               (addr - rom_base_) < rom_size_;
+        return image_registry_.find_image_for(addr) != nullptr;
     }
     bool map_addr_to_source(uint32_t addr, uint32_t* source) const;
     bool can_read_at(uint32_t addr, uint32_t len) const;

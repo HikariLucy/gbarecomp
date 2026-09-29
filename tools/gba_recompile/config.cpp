@@ -490,11 +490,56 @@ bool parse_exclude_funcs(const toml::array& arr,
     return true;
 }
 
+bool parse_executable_images(const toml::array& arr,
+                             std::vector<ConfigExecutableImage>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[executable_image]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigExecutableImage img;
+        bool ok = true;
+        std::string err;
+        img.id = get_string_field(*t, "id", true, ok, err);
+        if (!ok || img.id.empty()) {
+            std::fprintf(stderr,
+                "%s[[executable_image]] entry %zu: missing or empty 'id'\n",
+                kAbortHeader, i);
+            return false;
+        }
+        img.path = get_string_field(*t, "path", true, ok, err);
+        if (!ok || img.path.empty()) {
+            std::fprintf(stderr,
+                "%s[[executable_image]] entry %zu: missing or empty 'path'\n",
+                kAbortHeader, i);
+            return false;
+        }
+        img.load_address = get_u32_field(*t, "load_address", true, ok, err);
+        if (!ok) {
+            std::fprintf(stderr,
+                "%s[[executable_image]] entry %zu: %s\n",
+                kAbortHeader, i, err.c_str());
+            return false;
+        }
+        img.size = get_u32_field(*t, "size", false, ok, err);
+        img.sha256 = get_string_field(*t, "sha256", false, ok, err);
+        img.note = get_string_field(*t, "note", false, ok, err);
+        out.push_back(std::move(img));
+    }
+    return true;
+}
+
 // Parse every supplemental array — the tables that describe the binary rather
 // than the program itself. Shared by load_config() and load_config_overlay():
 // a base config and an overlay accept exactly the same set, so the two can
 // never drift apart as tables are added.
 bool parse_supplemental_arrays(const toml::table& tbl, Config& out) {
+    if (auto ei = tbl.at_path("executable_image").as_array()) {
+        if (!parse_executable_images(*ei, out.executable_images)) return false;
+    }
     if (auto ef = tbl.at_path("extra_func").as_array()) {
         if (!parse_extra_funcs(*ef, out.extra_funcs)) return false;
     }
@@ -531,6 +576,40 @@ bool parse_supplemental_arrays(const toml::table& tbl, Config& out) {
 // Cross-section structural validation. See docs/TOML_SCHEMA.md
 // "Precedence and conflict resolution" step 2.
 bool validate_cross_section(const Config& cfg) {
+    // executable_image validation
+    for (std::size_t i = 0; i < cfg.executable_images.size(); ++i) {
+        const auto& a = cfg.executable_images[i];
+        if (a.id.empty()) {
+            std::fprintf(stderr, "%s[[executable_image]] has empty id\n", kAbortHeader);
+            return false;
+        }
+        for (std::size_t j = i + 1; j < cfg.executable_images.size(); ++j) {
+            const auto& b = cfg.executable_images[j];
+            if (a.id == b.id) {
+                std::fprintf(stderr, "%sduplicate [[executable_image]] id '%s'\n", kAbortHeader, a.id.c_str());
+                return false;
+            }
+            if (a.size > 0 && b.size > 0) {
+                uint64_t a_start = a.load_address, a_end = a_start + a.size;
+                uint64_t b_start = b.load_address, b_end = b_start + b.size;
+                if (std::max(a_start, b_start) < std::min(a_end, b_end)) {
+                    std::fprintf(stderr, "%s[[executable_image]] '%s' and '%s' overlap in address space\n",
+                                 kAbortHeader, a.id.c_str(), b.id.c_str());
+                    return false;
+                }
+            }
+        }
+        if (cfg.program.size > 0 && a.size > 0) {
+            uint64_t a_start = a.load_address, a_end = a_start + a.size;
+            uint64_t p_start = cfg.program.load_address, p_end = p_start + cfg.program.size;
+            if (std::max(a_start, p_start) < std::min(a_end, p_end)) {
+                std::fprintf(stderr, "%s[[executable_image]] '%s' overlaps program image in address space\n",
+                             kAbortHeader, a.id.c_str());
+                return false;
+            }
+        }
+    }
+
     // exclude_func + extra_func at the same addr is contradictory.
     for (const auto& ex : cfg.exclude_funcs) {
         for (const auto& ef : cfg.extra_funcs) {
@@ -569,6 +648,13 @@ bool validate_cross_section(const Config& cfg) {
                 copy_start + static_cast<std::uint64_t>(cc.size);
             in_code_image = in_code_image ||
                 (rr.start >= copy_start && rr.end <= copy_end);
+        }
+        for (const auto& ei : cfg.executable_images) {
+            if (ei.size > 0) {
+                const uint64_t ei_start = ei.load_address;
+                const uint64_t ei_end = ei_start + static_cast<uint64_t>(ei.size);
+                in_code_image = in_code_image || (rr.start >= ei_start && rr.end <= ei_end);
+            }
         }
         if (!in_code_image) {
             std::fprintf(stderr,
@@ -610,6 +696,15 @@ bool validate_cross_section(const Config& cfg) {
                 (imm.addr >= copy_start &&
                  static_cast<std::uint64_t>(imm.addr) + 2u <= copy_end);
         }
+        for (const auto& ei : cfg.executable_images) {
+            if (ei.size > 0) {
+                const uint64_t ei_start = ei.load_address;
+                const uint64_t ei_end = ei_start + static_cast<uint64_t>(ei.size);
+                in_code_image = in_code_image ||
+                    (imm.addr >= ei_start &&
+                     static_cast<uint64_t>(imm.addr) + 2u <= ei_end);
+            }
+        }
         if (!in_code_image) {
             std::fprintf(stderr,
                 "%s[[thumb_alu_immediate_override]] 0x%08X is outside "
@@ -648,6 +743,15 @@ bool validate_cross_section(const Config& cfg) {
             in_code_image = in_code_image ||
                 (imm.addr >= copy_start &&
                  static_cast<std::uint64_t>(imm.addr) + 2u <= copy_end);
+        }
+        for (const auto& ei : cfg.executable_images) {
+            if (ei.size > 0) {
+                const uint64_t ei_start = ei.load_address;
+                const uint64_t ei_end = ei_start + static_cast<uint64_t>(ei.size);
+                in_code_image = in_code_image ||
+                    (imm.addr >= ei_start &&
+                     static_cast<uint64_t>(imm.addr) + 2u <= ei_end);
+            }
         }
         if (!in_code_image) {
             std::fprintf(stderr,
@@ -993,6 +1097,14 @@ bool load_config_overlay(const std::string& path, Config& base) {
         if (dup) { ++dropped_other; continue; }
         base.exclude_funcs.push_back(std::move(ex));
     }
+    for (auto& img : ov.executable_images) {
+        bool dup = false;
+        for (const auto& have : base.executable_images) {
+            if (have.id == img.id || have.load_address == img.load_address) { dup = true; break; }
+        }
+        if (dup) { ++dropped_other; continue; }
+        base.executable_images.push_back(std::move(img));
+    }
     for (auto& rr : ov.resume_ranges)  base.resume_ranges.push_back(std::move(rr));
     for (auto& h  : ov.mod_function_hooks)
         base.mod_function_hooks.push_back(std::move(h));
@@ -1079,6 +1191,7 @@ void print_config_summary(const Config& cfg) {
     }
     std::printf("  identity sha1:         %s (verified)\n",
                 hex_lower(cfg.identity.sha1).c_str());
+    std::printf("  executable_images:     %zu\n", cfg.executable_images.size());
     std::printf("  extra_func entries:    %zu\n", cfg.extra_funcs.size());
     std::printf("  resume_range entries:  %zu\n", cfg.resume_ranges.size());
     std::printf("  thumb immediate hooks: %zu\n",

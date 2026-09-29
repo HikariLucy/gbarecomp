@@ -241,6 +241,8 @@ add_library(gbarecomp_recompile_core STATIC
     src/recompile/emit_function.cpp
     src/recompile/codegen_shards.cpp
     src/recompile/dispatch_table_entries.cpp
+    src/recompile/executable_image.cpp
+    src/recompile/sha256.cpp
 )
 target_include_directories(gbarecomp_recompile_core PUBLIC src/recompile)
 target_link_libraries(gbarecomp_recompile_core PUBLIC gbarecomp_armv4t)
@@ -819,6 +821,10 @@ endif()
 add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
 target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME function_finder_tests COMMAND function_finder_tests)
+
+add_executable(executable_image_tests tests/recompile/executable_image_test.cpp)
+target_link_libraries(executable_image_tests PRIVATE gbarecomp_recompile_core)
+add_test(NAME executable_image_tests COMMAND executable_image_tests)
 
 add_executable(link_branch_tests tests/recompile/link_branch_test.cpp)
 target_link_libraries(link_branch_tests PRIVATE gbarecomp_recompile_core)

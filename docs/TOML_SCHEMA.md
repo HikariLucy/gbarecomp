@@ -372,6 +372,29 @@ walk), name the address here to remove it from the dispatch table.
 they conflict; declaring both at the same address is a hard error
 (contradictory intent).
 
+### `[[executable_image]]` (zero or more)
+
+Declares an external, derived, or standalone executable binary image loaded
+into guest address space at build time (e.g. dynamically unpacked or derived
+code blobs that do not exist uncompressed/contiguous in primary cartridge ROM).
+
+All executable images participate in function discovery, source-byte lookup,
+instruction decode, and cross-image call resolution, while sharing a unified
+dispatch table and public/private namespaces.
+
+| key            | type    | required | meaning |
+|----------------|---------|----------|---------|
+| `id`           | string  | yes      | Unique identifier for this image (e.g. `"nes_payload"`). |
+| `path`         | string  | yes      | File path to the binary on disk. |
+| `load_address` | int hex | yes      | Guest address base where the image resides (e.g. `0x03007400`). |
+| `size`         | int hex | no       | Expected size in bytes. If specified, must match file size exactly. |
+| `sha256`       | string  | no       | Expected SHA-256 hash. If specified, must match file contents. |
+| `note`         | string  | no       | Documentation. |
+
+Address ranges of `[[executable_image]]` entries must not overlap each other
+or the primary `[program]` image. Hash and size mismatches abort discovery
+immediately before any codegen.
+
 ## Overlay configs (`--config` more than once)
 
 `--config` is repeatable. The **first** path is the base config described

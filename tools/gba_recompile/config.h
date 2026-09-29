@@ -137,6 +137,15 @@ struct ConfigJumpTable {
     std::string         note;
 };
 
+struct ConfigExecutableImage {
+    std::string id;
+    std::string path;
+    uint32_t    load_address = 0;
+    uint32_t    size = 0;
+    std::string sha256;
+    std::string note;
+};
+
 struct ConfigExcludeFunc {
     uint32_t    addr = 0;
     std::string reason;     // required
@@ -146,6 +155,7 @@ struct Config {
     std::string             source_path;  // path the config was loaded from
     ConfigProgram           program;
     ConfigIdentity          identity;
+    std::vector<ConfigExecutableImage> executable_images;
     std::vector<ConfigExtraFunc>    extra_funcs;
     std::vector<ConfigResumeRange>  resume_ranges;
     std::vector<ConfigThumbAluImmediateOverride>

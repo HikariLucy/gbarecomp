@@ -30,6 +30,8 @@ namespace gbarecomp {
 bool link_register_dead_at(const uint8_t* image, std::size_t image_size,
                            uint32_t image_base, uint32_t target, bool thumb);
 
+class ExecutableImageRegistry;
+
 // Body text for `fn` (the inside of `void <name>(void) { ... }`).
 // `names_by_key` maps (addr<<1)|thumb → function name for resolving direct
 // B/BL targets to C calls; an EMPTY map lowers every B/BL to
@@ -43,7 +45,8 @@ std::string emit_function_body_str(
         alu_immediate_override_pcs = nullptr,
     const std::unordered_set<uint64_t>*
         mod_function_hook_keys = nullptr,
-    const std::unordered_set<uint64_t>* nonreturn_target_keys = nullptr);
+    const std::unordered_set<uint64_t>* nonreturn_target_keys = nullptr,
+    const ExecutableImageRegistry* image_registry = nullptr);
 
 // Thin FILE* wrapper: emit_function_body_str + fputs. Used by the offline
 // tool's write_body() so its output stays byte-identical.
@@ -55,6 +58,7 @@ void emit_function_body(
         alu_immediate_override_pcs = nullptr,
     const std::unordered_set<uint64_t>*
         mod_function_hook_keys = nullptr,
-    const std::unordered_set<uint64_t>* nonreturn_target_keys = nullptr);
+    const std::unordered_set<uint64_t>* nonreturn_target_keys = nullptr,
+    const ExecutableImageRegistry* image_registry = nullptr);
 
 }  // namespace gbarecomp

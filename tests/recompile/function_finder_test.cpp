@@ -348,6 +348,61 @@ int main() {
         return 1;
     }
 
+    // External executable image discovery test:
+    // Secondary image at 0x03007400 (ARM), containing:
+    //   0x03007400: mov r1, #0x14 (0xE3A01014)
+    //   0x03007404: b +8 -> 0x0300740C (0xEA000000)
+    //   0x03007408: nop (0xE1A00000)
+    //   0x0300740C: bx lr (0xE12FFF1E)
+    std::vector<std::uint8_t> primary_rom(0x100, 0);
+    put32(primary_rom, 0, 0xE12FFF1Eu); // bx lr
+
+    std::vector<std::uint8_t> ext_image(0x40, 0);
+    constexpr std::uint32_t kExtBase = 0x03007400u;
+    put32(ext_image, 0x00, 0xE3A01014u); // mov r1, #0x14
+    put32(ext_image, 0x04, 0xEA000000u); // b 0x0300740C
+    put32(ext_image, 0x08, 0xE1A00000u); // nop
+    put32(ext_image, 0x0C, 0xE12FFF1Eu); // bx lr
+
+    gbarecomp::FunctionFinder ext_finder(
+        primary_rom.data(), primary_rom.size(), kBase);
+    ext_finder.set_speculative_literal_harvest(false);
+
+    gbarecomp::ExecutableImage img;
+    img.id = "nes_payload";
+    img.load_address = kExtBase;
+    img.size = ext_image.size();
+    img.data = ext_image.data();
+    std::string ext_err;
+    if (!ext_finder.add_executable_image(img, &ext_err)) {
+        std::fprintf(stderr, "add_executable_image failed: %s\n", ext_err.c_str());
+        return 1;
+    }
+
+    ext_finder.add_seed({kBase, gbarecomp::CpuMode::Arm, "rom_entry"});
+    ext_finder.add_seed({kExtBase, gbarecomp::CpuMode::Arm, "ext_entry"});
+    ext_finder.run(16);
+
+    const auto* ext_fn = find_function(
+        ext_finder, kExtBase, gbarecomp::CpuMode::Arm);
+    const auto* ext_target = find_function(
+        ext_finder, kExtBase + 0x0Cu, gbarecomp::CpuMode::Arm);
+
+    if (!ext_fn) {
+        std::fprintf(stderr, "failed to discover external entry at 0x%08X\n", kExtBase);
+        return 1;
+    }
+    if (ext_fn->source_addr != kExtBase) {
+        std::fprintf(stderr, "external function source_addr expected 0x%08X, got 0x%08X\n",
+                     kExtBase, ext_fn->source_addr);
+        return 1;
+    }
+    if (!ext_target) {
+        std::fprintf(stderr, "failed to discover internal branch target at 0x%08X in external image\n",
+                     kExtBase + 0x0Cu);
+        return 1;
+    }
+
     std::printf("function_finder_tests: PASS\n");
     return 0;
 }

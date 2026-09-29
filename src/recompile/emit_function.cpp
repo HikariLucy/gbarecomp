@@ -6,6 +6,7 @@
 // FILE* — the format strings are identical, so the bytes are identical.
 
 #include "emit_function.h"
+#include "executable_image.h"
 
 #include <cstdarg>
 #include <unordered_set>
@@ -194,8 +195,20 @@ std::string emit_function_body_str(
     const std::unordered_set<uint32_t>*
         alu_immediate_override_pcs,
     const std::unordered_set<uint64_t>* mod_function_hook_keys,
-    const std::unordered_set<uint64_t>* nonreturn_target_keys) {
+    const std::unordered_set<uint64_t>* nonreturn_target_keys,
+    const ExecutableImageRegistry* image_registry) {
     std::string out;
+
+    const uint32_t fn_source_addr = fn.source_addr ? fn.source_addr : fn.addr;
+    if (image_registry) {
+        std::size_t off = 0;
+        const auto* img = image_registry->find_image_for(fn_source_addr, &off);
+        if (img) {
+            rom = img->data;
+            rom_size = img->size;
+            rom_base = img->load_address;
+        }
+    }
 
     const uint32_t step = (fn.mode == CpuMode::Thumb) ? 2u : 4u;
     armv4t::CodegenCtx ctx;
@@ -204,7 +217,6 @@ std::string emit_function_body_str(
     ctx.current_function_end_addr = fn.end_addr;
     ctx.current_function_thumb = (fn.mode == CpuMode::Thumb);
     ctx.alu_immediate_override_pcs = alu_immediate_override_pcs;
-    const uint32_t fn_source_addr = fn.source_addr ? fn.source_addr : fn.addr;
 
     auto source_offset_for = [&](uint32_t guest_pc, uint32_t len,
                                  std::size_t* out_off) -> bool {
@@ -416,10 +428,21 @@ std::string emit_function_body_str(
                 (fn.mode == CpuMode::Thumb ? 1u : 0u);
             const bool explicitly_nonreturning = is_bl && nonreturn_target_keys &&
                 nonreturn_target_keys->count(target_key) != 0;
+            const uint8_t* target_img_data = rom;
+            std::size_t target_img_size = rom_size;
+            uint32_t target_img_base = rom_base;
+            if (image_registry) {
+                const auto* t_img = image_registry->find_image_for(bl_target);
+                if (t_img) {
+                    target_img_data = t_img->data;
+                    target_img_size = t_img->size;
+                    target_img_base = t_img->load_address;
+                }
+            }
             if (is_bl && bl_target != link &&
                 (explicitly_nonreturning ||
                  (fn_source_addr == fn.addr &&
-                  link_register_dead_at(rom, rom_size, rom_base, bl_target,
+                  link_register_dead_at(target_img_data, target_img_size, target_img_base, bl_target,
                                         fn.mode == CpuMode::Thumb)))) {
                 link_branch_targets[scan_pc] = bl_target;
                 if (bl_target >= fn.addr && bl_target < fn.end_addr &&
@@ -600,12 +623,14 @@ void emit_function_body(
     const std::unordered_set<uint32_t>*
         alu_immediate_override_pcs,
     const std::unordered_set<uint64_t>* mod_function_hook_keys,
-    const std::unordered_set<uint64_t>* nonreturn_target_keys) {
+    const std::unordered_set<uint64_t>* nonreturn_target_keys,
+    const ExecutableImageRegistry* image_registry) {
     std::string body = emit_function_body_str(fn, rom, rom_size, rom_base,
                                               func_names_by_key,
                                               alu_immediate_override_pcs,
                                               mod_function_hook_keys,
-                                              nonreturn_target_keys);
+                                              nonreturn_target_keys,
+                                              image_registry);
     std::fwrite(body.data(), 1, body.size(), f);
 }
 

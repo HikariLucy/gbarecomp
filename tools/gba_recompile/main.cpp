@@ -63,6 +63,8 @@
 #include "codegen_shards.h"
 #include "dispatch_table_entries.h"
 #include "function_finder.h"
+#include "executable_image.h"
+#include "sha256.h"
 #include "arm_decode.h"    // armv4t::ArmDecoder
 #include "thumb_decode.h"  // armv4t::ThumbDecoder
 #include "arm_ir.h"        // armv4t::Instr, ir_op_name
@@ -74,6 +76,8 @@
 
 using gbarecomp::Config;
 using gbarecomp::CpuMode;
+using gbarecomp::ExecutableImage;
+using gbarecomp::ExecutableImageRegistry;
 using gbarecomp::Function;
 using gbarecomp::FunctionFinder;
 using gbarecomp::FunctionSeed;
@@ -810,7 +814,8 @@ void write_body(const std::string& dir,
                 uint32_t shard_count,
                 const std::unordered_set<uint32_t>*
                     alu_immediate_override_pcs,
-                const std::unordered_set<uint64_t>* mod_function_hook_keys) {
+                const std::unordered_set<uint64_t>* mod_function_hook_keys,
+                const ExecutableImageRegistry* image_registry = nullptr) {
     std::unordered_map<uint64_t, std::string> name_by_key;
     std::unordered_set<uint64_t> nonreturn_target_keys;
     for (const auto& fn : funcs) {
@@ -878,7 +883,8 @@ void write_body(const std::string& dir,
         emit_function_body(f, fn, rom, rom_size, rom_base, name_by_key,
                            alu_immediate_override_pcs,
                            mod_function_hook_keys,
-                           &nonreturn_target_keys);
+                           &nonreturn_target_keys,
+                           image_registry);
         std::fprintf(f, "}\n\n");
         }
         std::fclose(f);
@@ -1236,6 +1242,48 @@ int main(int argc, char** argv) {
                 ++jump_table_expanded_seeds;
             }
         }
+        for (const auto& img_cfg : cfg.executable_images) {
+            std::filesystem::path resolved_path = img_cfg.path;
+            if (resolved_path.is_relative()) {
+                if (!std::filesystem::exists(resolved_path) && !cfg.source_path.empty()) {
+                    auto from_config =
+                        std::filesystem::path(cfg.source_path).parent_path() / resolved_path;
+                    if (std::filesystem::exists(from_config)) {
+                        resolved_path = from_config;
+                    }
+                }
+            }
+            std::string read_err;
+            auto bytes = read_file(resolved_path.string(), &read_err);
+            if (bytes.empty()) {
+                std::fprintf(stderr,
+                             "error: executable_image '%s': failed to read '%s': %s\n",
+                             img_cfg.id.c_str(), resolved_path.string().c_str(),
+                             read_err.c_str());
+                return 1;
+            }
+            if (img_cfg.size != 0 && bytes.size() != static_cast<std::size_t>(img_cfg.size)) {
+                std::fprintf(stderr,
+                             "error: executable_image '%s': size mismatch (expected %zu, got %zu)\n",
+                             img_cfg.id.c_str(), static_cast<std::size_t>(img_cfg.size), bytes.size());
+                return 1;
+            }
+            ExecutableImage img;
+            img.id = img_cfg.id;
+            img.load_address = img_cfg.load_address;
+            img.size = bytes.size();
+            img.storage = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
+            img.data = img.storage->data();
+            img.path = resolved_path.string();
+            img.sha256 = img_cfg.sha256;
+            img.note = img_cfg.note;
+
+            std::string reg_err;
+            if (!finder.add_executable_image(img, &reg_err)) {
+                std::fprintf(stderr, "error: %s\n", reg_err.c_str());
+                return 1;
+            }
+        }
         for (const auto& ef : cfg.extra_funcs) {
             FunctionSeed seed{ef.addr, ef.mode, ef.name};
             seed.source_addr = ef.source_addr;
@@ -1419,6 +1467,8 @@ int main(int argc, char** argv) {
                     cfg.data_ranges.size() + cfg.jump_tables.size());
         std::printf("  code_copies:           %zu\n",
                     cfg.code_copies.size());
+        std::printf("  executable_images:     %zu\n",
+                    cfg.executable_images.size());
         std::printf("  midfn_aliases:         %zu entries -> %zu hosts "
                     "(rolled-up interior resume points)\n",
                     stats.alias_entries_total, stats.alias_hosts_total);
@@ -1537,7 +1587,8 @@ int main(int argc, char** argv) {
                alu_immediate_override_pcs.empty()
                    ? nullptr : &alu_immediate_override_pcs,
                mod_function_hook_keys.empty()
-                   ? nullptr : &mod_function_hook_keys);
+                   ? nullptr : &mod_function_hook_keys,
+               &finder.image_registry());
     write_dispatch_table(cli.out_dir, emit_funcs, names);
     std::printf("==> wrote %s/{%s, %s%s, %s}\n",
                 cli.out_dir.c_str(),

@@ -73,7 +73,21 @@ bool jt_report_enabled() {
 FunctionFinder::FunctionFinder(const uint8_t* rom_bytes,
                                 std::size_t rom_size,
                                 uint32_t rom_base)
-    : rom_(rom_bytes), rom_size_(rom_size), rom_base_(rom_base) {}
+    : rom_(rom_bytes), rom_size_(rom_size), rom_base_(rom_base) {
+    if (rom_bytes && rom_size > 0) {
+        ExecutableImage primary;
+        primary.id = "primary";
+        primary.load_address = rom_base;
+        primary.size = rom_size;
+        primary.data = rom_bytes;
+        image_registry_.add_image(primary);
+    }
+}
+
+bool FunctionFinder::add_executable_image(const ExecutableImage& image,
+                                         std::string* error) {
+    return image_registry_.add_image(image, error);
+}
 
 void FunctionFinder::add_seed(const FunctionSeed& seed) {
     if (seed.alias_candidate) {
@@ -130,7 +144,7 @@ bool FunctionFinder::map_addr_to_source(uint32_t addr,
 bool FunctionFinder::can_read_at(uint32_t addr, uint32_t len) const {
     uint32_t source = 0;
     if (!map_addr_to_source(addr, &source)) return false;
-    return (source - rom_base_ + len) <= rom_size_;
+    return image_registry_.can_read(source, len);
 }
 
 bool FunctionFinder::addr_in_data_range(uint32_t addr) const {
@@ -176,11 +190,13 @@ void FunctionFinder::record_collision(uint32_t target,
 uint32_t FunctionFinder::read_u32(uint32_t addr) const {
     uint32_t source = addr;
     map_addr_to_source(addr, &source);
-    std::size_t off = source - rom_base_;
-    return  static_cast<uint32_t>(rom_[off])
-         | (static_cast<uint32_t>(rom_[off + 1]) << 8)
-         | (static_cast<uint32_t>(rom_[off + 2]) << 16)
-         | (static_cast<uint32_t>(rom_[off + 3]) << 24);
+    std::size_t off = 0;
+    const auto* img = image_registry_.find_image_for(source, &off);
+    if (!img || off + 4 > img->size) return 0;
+    return  static_cast<uint32_t>(img->data[off])
+         | (static_cast<uint32_t>(img->data[off + 1]) << 8)
+         | (static_cast<uint32_t>(img->data[off + 2]) << 16)
+         | (static_cast<uint32_t>(img->data[off + 3]) << 24);
 }
 
 uint32_t FunctionFinder::read_u32_public(uint32_t addr) const {
@@ -191,9 +207,11 @@ uint32_t FunctionFinder::read_u32_public(uint32_t addr) const {
 uint16_t FunctionFinder::read_u16(uint32_t addr) const {
     uint32_t source = addr;
     map_addr_to_source(addr, &source);
-    std::size_t off = source - rom_base_;
-    return  static_cast<uint16_t>(rom_[off])
-         | (static_cast<uint16_t>(rom_[off + 1]) << 8);
+    std::size_t off = 0;
+    const auto* img = image_registry_.find_image_for(source, &off);
+    if (!img || off + 2 > img->size) return 0;
+    return  static_cast<uint16_t>(img->data[off])
+         | (static_cast<uint16_t>(img->data[off + 1]) << 8);
 }
 
 bool FunctionFinder::looks_like_code(uint32_t addr, CpuMode mode,
@@ -439,6 +457,10 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         return;
     }
 
+    std::size_t entry_off = 0;
+    const auto* entry_img = image_registry_.find_image_for(entry_source, &entry_off);
+    if (!entry_img) return;
+
     // An explicit source address describes one observed placement of a
     // position-independent ROM routine in RAM. Fixed code_copy ranges may
     // overlap that placement (stack copies naturally move as call depth
@@ -448,30 +470,33 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         const int64_t delta = static_cast<int64_t>(addr) -
             static_cast<int64_t>(entry_addr);
         const int64_t mapped = static_cast<int64_t>(entry_source) + delta;
-        if (mapped < 0 || mapped > 0xFFFFFFFFll) return false;
+        if (mapped < static_cast<int64_t>(entry_img->load_address) ||
+            mapped >= static_cast<int64_t>(entry_img->load_address + entry_img->size)) {
+            return false;
+        }
         *source = static_cast<uint32_t>(mapped);
-        return addr_in_rom(*source);
+        return true;
     };
     auto can_read_walk_at = [&](uint32_t addr, uint32_t len) -> bool {
         uint32_t source = 0;
         if (!walk_source_for(addr, &source)) return false;
-        return static_cast<uint64_t>(source - rom_base_) + len <= rom_size_;
+        return (source - entry_img->load_address + len) <= entry_img->size;
     };
     auto read_walk_u16 = [&](uint32_t addr) -> uint16_t {
         uint32_t source = 0;
         walk_source_for(addr, &source);
-        const std::size_t off = source - rom_base_;
-        return static_cast<uint16_t>(rom_[off]) |
-            (static_cast<uint16_t>(rom_[off + 1]) << 8);
+        const std::size_t off = source - entry_img->load_address;
+        return static_cast<uint16_t>(entry_img->data[off]) |
+            (static_cast<uint16_t>(entry_img->data[off + 1]) << 8);
     };
     auto read_walk_u32 = [&](uint32_t addr) -> uint32_t {
         uint32_t source = 0;
         walk_source_for(addr, &source);
-        const std::size_t off = source - rom_base_;
-        return static_cast<uint32_t>(rom_[off]) |
-            (static_cast<uint32_t>(rom_[off + 1]) << 8) |
-            (static_cast<uint32_t>(rom_[off + 2]) << 16) |
-            (static_cast<uint32_t>(rom_[off + 3]) << 24);
+        const std::size_t off = source - entry_img->load_address;
+        return static_cast<uint32_t>(entry_img->data[off]) |
+            (static_cast<uint32_t>(entry_img->data[off + 1]) << 8) |
+            (static_cast<uint32_t>(entry_img->data[off + 2]) << 16) |
+            (static_cast<uint32_t>(entry_img->data[off + 3]) << 24);
     };
     auto can_read_literal = [&](uint32_t addr) {
         return can_read_at(addr, 4) ||

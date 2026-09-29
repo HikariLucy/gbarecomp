@@ -123,6 +123,35 @@ int main() {
         fs::remove(path, ec);
         return fail("mode-conflicting mod_function_hook was accepted");
     }
+
+    const std::string valid_img = base_config(
+        "[[executable_image]]\n"
+        "id = \"test_img\"\n"
+        "path = \"test.bin\"\n"
+        "load_address = 0x03001000\n"
+        "size = 0x100\n"
+        "sha256 = \"abcdef1234567890\"\n");
+    if (!write_file(path, valid_img) || !gbarecomp::load_config(path.string(), cfg) ||
+        cfg.executable_images.size() != 1 ||
+        cfg.executable_images[0].id != "test_img" ||
+        cfg.executable_images[0].load_address != 0x03001000 ||
+        cfg.executable_images[0].size != 0x100 ||
+        cfg.executable_images[0].sha256 != "abcdef1234567890") {
+        fs::remove(path, ec);
+        return fail("valid executable_image did not parse correctly");
+    }
+
+    const std::string img_overlaps_program = base_config(
+        "[[executable_image]]\n"
+        "id = \"conflict_img\"\n"
+        "path = \"test.bin\"\n"
+        "load_address = 0x08000080\n"
+        "size = 0x100\n");
+    if (!write_file(path, img_overlaps_program) || gbarecomp::load_config(path.string(), cfg)) {
+        fs::remove(path, ec);
+        return fail("executable_image overlapping [program] was accepted");
+    }
+
     fs::remove(path, ec);
     return 0;
 }
