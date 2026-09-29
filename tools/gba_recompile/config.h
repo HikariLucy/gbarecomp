@@ -76,6 +76,8 @@ struct ConfigExtraFunc {
     // (alternate dispatch target) instead of fragmenting the host. Used for
     // IRQ/SWI-return resume PCs (e.g. a WaitForVBlank busy-spin interior).
     bool        resume = false;
+    // A trusted caller may invoke the generated symbol; static dispatch omits it.
+    bool        private_entry = false;
 };
 
 // An explicitly reviewed interruptible host span. Every aligned instruction

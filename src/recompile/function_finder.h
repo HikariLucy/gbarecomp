@@ -54,6 +54,8 @@ struct FunctionSeed {
     // avoids mis-aliasing the thousands of real functions whose entries
     // happen to fall within another function's over-extending linear walk.
     bool alias_candidate = false;
+    // Emit a callable native body, but omit ordinary static dispatch.
+    bool private_entry = false;
 };
 
 // Output: one entry per discovered function.
@@ -91,6 +93,7 @@ struct Function {
     // Set during alias consolidation to mark this entry for removal from the
     // function list (it was rolled into its host's alias_entries).
     bool is_alias = false;
+    bool private_entry = false;
 };
 
 // A jump table the finder recognized automatically (no [[jump_table]]
@@ -323,6 +326,7 @@ private:
     void discover_one(uint32_t addr, CpuMode mode,
                       const std::string& name,
                       uint32_t source_addr = 0,
+                      bool private_entry = false,
                       bool speculative = false);
 
     // Set at the top of each discover_one from its `speculative` arg.

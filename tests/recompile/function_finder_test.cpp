@@ -1,5 +1,6 @@
 #include "function_finder.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -89,17 +90,30 @@ int main() {
     relocated.set_speculative_literal_harvest(false);
     relocated.add_code_copy(kRam, kBase + kTemplate, 0x20, "first copy");
     relocated.add_seed({kRam, gbarecomp::CpuMode::Thumb, "first"});
+    gbarecomp::FunctionSeed older_public{
+        kRam + 4, gbarecomp::CpuMode::Thumb, "older_public_seed"};
+    older_public.source_addr = kBase + kTemplate + 4;
+    relocated.add_seed(older_public);
     gbarecomp::FunctionSeed overlapping{
         kRam + 4, gbarecomp::CpuMode::Thumb, "overlapping"};
     overlapping.source_addr = kBase + kTemplate;
+    overlapping.private_entry = true;
     relocated.add_seed(overlapping);
+    relocated.add_seed({kRam + 12, gbarecomp::CpuMode::Thumb, "older_target"});
     relocated.run(32);
 
     const auto* overlap_fn = find_function(
         relocated, kRam + 4, gbarecomp::CpuMode::Thumb);
-    if (!overlap_fn || overlap_fn->source_addr != kBase + kTemplate) {
+    if (!overlap_fn || !overlap_fn->private_entry ||
+        overlap_fn->source_addr != kBase + kTemplate) {
         std::fprintf(stderr,
                      "overlapping relocation did not retain explicit ROM backing\n");
+        return 1;
+    }
+    if (std::find(overlap_fn->alias_entries.begin(),
+                  overlap_fn->alias_entries.end(), kRam + 6u) ==
+        overlap_fn->alias_entries.end()) {
+        std::fprintf(stderr, "private function lacks interior resume alias\n");
         return 1;
     }
     if (overlap_fn->end_addr <= kRam + 8) {
@@ -109,7 +123,7 @@ int main() {
     }
     const auto* overlap_target = find_function(
         relocated, kRam + 12, gbarecomp::CpuMode::Thumb);
-    if (!overlap_target ||
+    if (!overlap_target || !overlap_target->private_entry ||
         overlap_target->source_addr != kBase + kTemplate + 8) {
         std::fprintf(stderr,
                      "relocation bias did not propagate to direct branch target\n");

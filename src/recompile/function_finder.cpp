@@ -428,6 +428,7 @@ std::vector<FunctionSeed> FunctionFinder::collect_code_copy_seeds() const {
 void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                                    const std::string& seed_name,
                                    uint32_t seed_source_addr,
+                                   bool private_entry,
                                    bool speculative) {
     uint32_t entry_source = 0;
     if (seed_source_addr != 0) {
@@ -482,6 +483,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
     Function fn{};
     fn.addr = entry_addr;
     fn.source_addr = entry_source;
+    fn.private_entry = private_entry;
     fn.mode = entry_mode;
     fn.name = seed_name.empty() ? default_name(entry_addr, entry_mode)
                                 : seed_name;
@@ -1885,7 +1887,10 @@ void FunctionFinder::run(std::size_t max_functions) {
     for (const auto& s : seeds_) {
         uint64_t k = visit_key(s.addr, s.mode);
         seed_keys.insert(k);
-        seed_by_key.emplace(k, s);
+        // An explicit private relocation must outrank an older implicit seed
+        // at the same runtime PC; its ROM backing determines this CFG.
+        if (s.private_entry) seed_by_key[k] = s;
+        else seed_by_key.emplace(k, s);
     }
     stats_.manual_seeds_total = manual_seed_count;
 
@@ -1912,6 +1917,10 @@ void FunctionFinder::run(std::size_t max_functions) {
         worklist.push_back(QueuedSeed{
             seeds_[i], i < manual_seed_count});
     }
+    // Resolve explicitly private placements before generic scans can visit
+    // one of their RAM CFG targets using a different backing image.
+    std::stable_partition(worklist.begin(), worklist.end(),
+        [](const QueuedSeed& queued) { return queued.seed.private_entry; });
     std::size_t required_remaining = manual_seed_count;
 
     // Per-key origin marker: was this (addr, mode) reached as a
@@ -1956,13 +1965,15 @@ void FunctionFinder::run(std::size_t max_functions) {
             if (!seed_it->second.name.empty()) {
                 s.name = seed_it->second.name;
             }
-            if (s.source_addr == 0) {
+            if (s.source_addr == 0 || seed_it->second.private_entry) {
                 s.source_addr = seed_it->second.source_addr;
             }
+            s.private_entry = s.private_entry || seed_it->second.private_entry;
         }
 
         std::size_t before = functions_.size();
-        discover_one(s.addr, s.mode, s.name, s.source_addr, s.speculative);
+        discover_one(s.addr, s.mode, s.name, s.source_addr,
+                     s.private_entry, s.speculative);
         if (functions_.size() == before) continue;
 
         // The function we just added is at the end of functions_.
@@ -1977,7 +1988,6 @@ void FunctionFinder::run(std::size_t max_functions) {
             // Mark walk-origin. If this address was ALSO a seed,
             // it now has both bits set (redundant_manual).
             origin_mask[k] |= 2u;
-            if (!enqueued.insert(k).second) continue;  // already queued
             // Propagate speculation: a branch target reached only from a
             // speculative (literal-pool) walk is itself speculative.
             uint32_t target_source = 0;
@@ -1991,10 +2001,19 @@ void FunctionFinder::run(std::size_t max_functions) {
                     target_source = static_cast<uint32_t>(mapped);
                 }
             }
+            FunctionSeed target{t, fn.mode, "", target_source,
+                                s.speculative};
+            target.private_entry = fn.private_entry;
+            if (fn.private_entry) {
+                auto existing = seed_by_key.find(k);
+                if (existing != seed_by_key.end()) {
+                    existing->second.private_entry = true;
+                    existing->second.source_addr = target_source;
+                }
+            }
+            if (!enqueued.insert(k).second) continue;  // already queued
             discovered_seeds.push_back(
-                QueuedSeed{FunctionSeed{t, fn.mode, "", target_source,
-                                        s.speculative},
-                           current_required});
+                QueuedSeed{target, current_required});
             if (current_required) {
                 ++required_remaining;
             }
@@ -2166,13 +2185,13 @@ void FunctionFinder::run(std::size_t max_functions) {
             functions_.end());
     }
 
-    // Full static-resume coverage. IRQ/SWI return may land at any instruction
-    // boundary in a native body. Add every interior boundary as an alias after
-    // real function boundaries and explicit aliases have been consolidated.
-    // The host body stays intact, preserving native straight-line execution
-    // and goto back-edges.
-    if (static_resume_all_) {
+    // Full static-resume coverage. Private bodies also need interior labels
+    // for a trusted byte-gated RAM hook to re-enter after an allowed unwind;
+    // their labels stay out of the ordinary global dispatch table.
+    if (static_resume_all_ || std::any_of(functions_.begin(), functions_.end(),
+            [](const Function& f) { return f.private_entry; })) {
         for (Function& f : functions_) {
+            if (!static_resume_all_ && !f.private_entry) continue;
             const uint32_t step =
                 f.mode == CpuMode::Thumb ? 2u : 4u;
             for (uint32_t pc = f.addr + step;

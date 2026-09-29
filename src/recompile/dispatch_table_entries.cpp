@@ -17,6 +17,7 @@ std::vector<DispatchTableEntrySpec> build_dispatch_table_entries(
 
     for (std::size_t i = 0; i < functions.size(); ++i) {
         const Function& function = functions[i];
+        if (function.private_entry) continue;
         const bool thumb = function.mode == CpuMode::Thumb;
         entries.push_back({function.addr, thumb, false, i});
         for (std::uint32_t addr : function.alias_entries) {

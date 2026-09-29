@@ -785,6 +785,37 @@ else()
         "gbarecomp: no Python3 interpreter; skipping symbol_import_golden")
 endif()
 
+if(Python3_Interpreter_FOUND AND UNIX)
+    set(PRIVATE_RELOC_FIXTURE_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/private_relocation_fixture")
+    set(PRIVATE_RELOC_GENERATED_DIR
+        "${PRIVATE_RELOC_FIXTURE_DIR}/generated")
+    add_custom_command(
+        OUTPUT
+            "${PRIVATE_RELOC_GENERATED_DIR}/recompiled.h"
+            "${PRIVATE_RELOC_GENERATED_DIR}/recompiled_000.cpp"
+            "${PRIVATE_RELOC_GENERATED_DIR}/recompiled_001.cpp"
+            "${PRIVATE_RELOC_GENERATED_DIR}/dispatch_table.cpp"
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/private_relocation/generate_fixture.py"
+            "$<TARGET_FILE:gba_recompile>"
+            "${PRIVATE_RELOC_FIXTURE_DIR}"
+        DEPENDS gba_recompile
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/private_relocation/generate_fixture.py"
+        VERBATIM)
+    add_executable(private_relocation_runtime_tests
+        tests/recompile/private_relocation/runtime_test.cpp
+        "${PRIVATE_RELOC_GENERATED_DIR}/recompiled_000.cpp"
+        "${PRIVATE_RELOC_GENERATED_DIR}/recompiled_001.cpp"
+        "${PRIVATE_RELOC_GENERATED_DIR}/dispatch_table.cpp")
+    target_include_directories(private_relocation_runtime_tests PRIVATE
+        "${PRIVATE_RELOC_GENERATED_DIR}" src/armv4t src/gba src/runtime)
+    target_link_gbarecomp_runtime_stack(private_relocation_runtime_tests)
+    add_test(NAME private_relocation_runtime_tests
+        COMMAND private_relocation_runtime_tests
+            "${PRIVATE_RELOC_FIXTURE_DIR}/fixture.gba")
+endif()
+
 add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
 target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME function_finder_tests COMMAND function_finder_tests)

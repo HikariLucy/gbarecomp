@@ -69,6 +69,20 @@ int main() {
         ok = false;
     }
 
+    // A generated private body remains callable by name but has no ordinary
+    // root or resume entry in the global dispatch table.
+    gbarecomp::Function private_fn{};
+    private_fn.addr = 0x03001000u;
+    private_fn.mode = gbarecomp::CpuMode::Thumb;
+    private_fn.private_entry = true;
+    private_fn.alias_entries = {0x03001002u};
+    const auto private_entries =
+        gbarecomp::build_dispatch_table_entries({private_fn});
+    if (!private_entries.empty()) {
+        std::fprintf(stderr, "private function leaked into dispatch table\n");
+        ok = false;
+    }
+
     // Config-fed entry allowlists must produce a handling guard only at the
     // reviewed ARM/THUMB root; the default emitter remains hook-free.
     gbarecomp::Function hooked{};

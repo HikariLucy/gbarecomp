@@ -52,6 +52,34 @@ int main() {
         return fail("valid mod_function_hook did not parse");
     }
 
+    const std::string private_relocated = base_config(
+        "[[extra_func]]\n"
+        "addr = 0x03001000\n"
+        "source_addr = 0x08000020\n"
+        "mode = \"thumb\"\n"
+        "dispatch = false\n");
+    if (!write_file(path, private_relocated) ||
+        !gbarecomp::load_config(path.string(), cfg) ||
+        cfg.extra_funcs.size() != 1 ||
+        !cfg.extra_funcs[0].private_entry ||
+        cfg.extra_funcs[0].source_addr != 0x08000020u) {
+        fs::remove(path, ec);
+        return fail("private relocated extra_func did not parse");
+    }
+
+    const std::string private_resume = base_config(
+        "[[extra_func]]\n"
+        "addr = 0x03001002\n"
+        "source_addr = 0x08000022\n"
+        "mode = \"thumb\"\n"
+        "resume = true\n"
+        "dispatch = false\n");
+    if (!write_file(path, private_resume) ||
+        gbarecomp::load_config(path.string(), cfg)) {
+        fs::remove(path, ec);
+        return fail("private resume alias was accepted without a private host");
+    }
+
     const std::string unaligned = base_config(
         "[[mod_function_hook]]\n"
         "addr = 0x08000021\n"

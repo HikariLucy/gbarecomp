@@ -143,6 +143,15 @@ bool parse_extra_funcs(const toml::array& arr,
         e.name = get_string_field(*t, "name", false, ok, err);
         e.note = get_string_field(*t, "note", false, ok, err);
         e.resume = (*t)["resume"].value_or(false);
+        e.private_entry = !(*t)["dispatch"].value_or(true);
+        if (e.private_entry && e.resume) {
+            std::fprintf(stderr,
+                "%s[[extra_func]] entry %zu: dispatch=false cannot be "
+                "combined with resume=true; private bodies provide "
+                "interior resume labels automatically\n",
+                kAbortHeader, i);
+            return false;
+        }
         out.push_back(std::move(e));
     }
     return true;

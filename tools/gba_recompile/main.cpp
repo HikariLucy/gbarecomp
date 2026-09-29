@@ -1207,6 +1207,7 @@ int main(int argc, char** argv) {
             FunctionSeed seed{ef.addr, ef.mode, ef.name};
             seed.source_addr = ef.source_addr;
             seed.alias_candidate = ef.resume;  // interior/resume seed -> alias
+            seed.private_entry = ef.private_entry;
             finder.add_seed(seed);
         }
         for (const auto& rr : cfg.resume_ranges) {
