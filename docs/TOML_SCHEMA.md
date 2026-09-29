@@ -142,6 +142,7 @@ coverage).
 | `mode`        | string  | yes      | `"arm"` or `"thumb"`. Must match the actual instruction encoding at `addr`. |
 | `resume`      | bool    | no       | Default `false`. Mark an interior IRQ/SWI return PC so it is rolled into its containing function and emitted as a thin resume alias. |
 | `dispatch`    | bool    | no       | Default `true`. Set `false` to emit a callable native body with guest PCs at `addr` and opcodes at `source_addr`, without publishing its root or valid interior resume PCs in ordinary static dispatch. |
+| `returns`     | bool    | no       | Default `true`. Set `false` only for a proven entry that never returns to the instruction after its caller's BL. The entry can transfer to any other guest PC and can still resume internally after an interrupt. Contradictory explicit declarations are errors. |
 | `name`        | string  | no       | Function name in generated C. Default: `afunc_AAAAAAAA` (ARM) or `tfunc_AAAAAAAA` (THUMB). |
 | `note`        | string  | no       | Free-form documentation. Ignored by the recompiler. |
 

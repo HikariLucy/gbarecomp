@@ -144,6 +144,17 @@ bool parse_extra_funcs(const toml::array& arr,
         e.note = get_string_field(*t, "note", false, ok, err);
         e.resume = (*t)["resume"].value_or(false);
         e.private_entry = !(*t)["dispatch"].value_or(true);
+        auto returns_node = (*t)["returns"];
+        if (returns_node) {
+            if (!returns_node.is_boolean()) {
+                std::fprintf(stderr,
+                    "%s[[extra_func]] entry %zu: returns must be boolean\n",
+                    kAbortHeader, i);
+                return false;
+            }
+            e.returns = returns_node.value<bool>().value();
+            e.returns_declared = true;
+        }
         if (e.private_entry && e.resume) {
             std::fprintf(stderr,
                 "%s[[extra_func]] entry %zu: dispatch=false cannot be "
@@ -894,8 +905,19 @@ bool load_config_overlay(const std::string& path, Config& base) {
     // first-insert-wins and base seeds are added first.
     for (auto& ef : ov.extra_funcs) {
         bool skip = false;
-        for (const auto& have : base.extra_funcs) {
+        for (auto& have : base.extra_funcs) {
             if (have.addr == ef.addr && have.mode == ef.mode) {
+                if (have.returns_declared && ef.returns_declared &&
+                    have.returns != ef.returns) {
+                    std::fprintf(stderr,
+                        "%sconflicting explicit returns policy at 0x%08X\n",
+                        kAbortHeader, ef.addr);
+                    return false;
+                }
+                if (!have.returns_declared && ef.returns_declared) {
+                    have.returns = ef.returns;
+                    have.returns_declared = true;
+                }
                 ++dropped_dup;
                 skip = true;
                 break;

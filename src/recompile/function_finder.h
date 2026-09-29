@@ -58,6 +58,10 @@ struct FunctionSeed {
     bool private_entry = false;
     // Explicit [[extra_func]] dispatch policy, as opposed to discovery.
     bool dispatch_declared = false;
+    // Explicit call-site contract: this entry never returns to the
+    // instruction following its caller's BL. It may transfer elsewhere.
+    bool returns = true;
+    bool returns_declared = false;
 };
 
 // Output: one entry per discovered function.
@@ -98,6 +102,7 @@ struct Function {
     // function list (it was rolled into its host's alias_entries).
     bool is_alias = false;
     bool private_entry = false;
+    bool returns = true;
 };
 
 // A jump table the finder recognized automatically (no [[jump_table]]
@@ -260,6 +265,7 @@ private:
     uint32_t       rom_base_;
 
     std::vector<FunctionSeed> seeds_;
+    std::unordered_set<uint64_t> nonreturn_keys_;
     std::vector<Function>     functions_;
     std::unordered_map<uint64_t, std::size_t> visited_;  // key=(addr<<1)|mode
     // Keys (addr<<1|mode) of explicit interior/resume seeds — candidates for

@@ -78,6 +78,8 @@ struct ConfigExtraFunc {
     bool        resume = false;
     // A trusted caller may invoke the generated symbol; static dispatch omits it.
     bool        private_entry = false;
+    bool        returns = true;
+    bool        returns_declared = false;
 };
 
 // An explicitly reviewed interruptible host span. Every aligned instruction

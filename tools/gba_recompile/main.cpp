@@ -812,10 +812,12 @@ void write_body(const std::string& dir,
                     alu_immediate_override_pcs,
                 const std::unordered_set<uint64_t>* mod_function_hook_keys) {
     std::unordered_map<uint64_t, std::string> name_by_key;
+    std::unordered_set<uint64_t> nonreturn_target_keys;
     for (const auto& fn : funcs) {
         uint64_t key = (static_cast<uint64_t>(fn.addr) << 1u) |
             (fn.mode == CpuMode::Thumb ? 1u : 0u);
         name_by_key[key] = fn.name;
+        if (!fn.returns) nonreturn_target_keys.insert(key);
     }
 
     const std::string body_name = names.body;
@@ -875,7 +877,8 @@ void write_body(const std::string& dir,
             fn.name.c_str());
         emit_function_body(f, fn, rom, rom_size, rom_base, name_by_key,
                            alu_immediate_override_pcs,
-                           mod_function_hook_keys);
+                           mod_function_hook_keys,
+                           &nonreturn_target_keys);
         std::fprintf(f, "}\n\n");
         }
         std::fclose(f);
@@ -1239,6 +1242,8 @@ int main(int argc, char** argv) {
             seed.alias_candidate = ef.resume;  // interior/resume seed -> alias
             seed.private_entry = ef.private_entry;
             seed.dispatch_declared = true;
+            seed.returns = ef.returns;
+            seed.returns_declared = ef.returns_declared;
             finder.add_seed(seed);
         }
         for (const auto& rr : cfg.resume_ranges) {

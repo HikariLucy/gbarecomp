@@ -67,6 +67,29 @@ int main() {
         return fail("private relocated extra_func did not parse");
     }
 
+    const std::string nonreturn = base_config(
+        "[[extra_func]]\n"
+        "addr = 0x08000020\n"
+        "mode = \"arm\"\n"
+        "returns = false\n");
+    if (!write_file(path, nonreturn) ||
+        !gbarecomp::load_config(path.string(), cfg) ||
+        cfg.extra_funcs.size() != 1 ||
+        !cfg.extra_funcs[0].returns_declared || cfg.extra_funcs[0].returns) {
+        fs::remove(path, ec);
+        return fail("explicit non-returning function did not parse");
+    }
+    const std::string invalid_returns = base_config(
+        "[[extra_func]]\n"
+        "addr = 0x08000020\n"
+        "mode = \"arm\"\n"
+        "returns = \"false\"\n");
+    if (!write_file(path, invalid_returns) ||
+        gbarecomp::load_config(path.string(), cfg)) {
+        fs::remove(path, ec);
+        return fail("non-boolean returns was accepted");
+    }
+
     const std::string private_resume = base_config(
         "[[extra_func]]\n"
         "addr = 0x03001002\n"

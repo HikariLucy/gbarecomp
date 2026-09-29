@@ -495,6 +495,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
     fn.addr = entry_addr;
     fn.source_addr = entry_source;
     fn.private_entry = private_entry;
+    fn.returns = nonreturn_keys_.count(key) == 0;
     fn.mode = entry_mode;
     fn.name = seed_name.empty() ? default_name(entry_addr, entry_mode)
                                 : seed_name;
@@ -503,6 +504,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
     visited_[key] = functions_.size();  // index will be re-sorted at end
 
     uint32_t pc = entry_addr;
+    std::unordered_set<uint32_t> nonreturn_thumb_suffixes;
     const uint32_t step = (entry_mode == CpuMode::Thumb) ? 2u : 4u;
     constexpr std::size_t kMaxInstrs = 4096;
     std::size_t count = 0;
@@ -1198,7 +1200,9 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 // half's intermediate target, which is not the call
                 // target and can point into data for long BLs.
                 uint32_t return_pc = pc + 4u;
-                if (can_read_at(return_pc, 2)) {
+                if (nonreturn_keys_.count(visit_key(full, entry_mode))) {
+                    nonreturn_thumb_suffixes.insert(pc + 2u);
+                } else if (can_read_at(return_pc, 2)) {
                     enqueue_resolved_target(return_pc, entry_mode, "branch");
                 }
             }
@@ -1207,7 +1211,11 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         // Indirect = computed; we can't follow statically — UNLESS
         // our narrow constant tracker resolved the source register
         // to a known value just above the BX (or MOV PC, Rn).
-        if (ins.op == armv4t::IrOp::SWI) {
+        const bool soft_reset = ins.op == armv4t::IrOp::SWI &&
+            (entry_mode == CpuMode::Thumb
+                ? (ins.swi_imm & 0xFFu) == 0u
+                : ((ins.swi_imm >> 16) & 0xFFu) == 0u);
+        if (ins.op == armv4t::IrOp::SWI && !soft_reset) {
             enqueue_resolved_target(ins.pc + step, entry_mode, "branch");
         }
 
@@ -1824,6 +1832,12 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
 
         pc += step;
         fn.end_addr = pc;
+        const bool nonreturn_arm_call =
+            ins.op == armv4t::IrOp::BL &&
+            ins.cond == armv4t::Cond::AL &&
+            nonreturn_keys_.count(visit_key(ins.branch_target, entry_mode));
+        if (soft_reset || nonreturn_arm_call ||
+            nonreturn_thumb_suffixes.count(ins.pc) != 0) break;
 
         // A conditional indirect transfer is not a terminator when
         // its condition fails. Because the finder stops at indirects,
@@ -1873,6 +1887,17 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
 }
 
 void FunctionFinder::run(std::size_t max_functions) {
+    nonreturn_keys_.clear();
+    std::unordered_map<uint64_t, bool> explicit_returns;
+    for (const auto& seed : seeds_) {
+        if (!seed.returns_declared) continue;
+        const auto key = visit_key(seed.addr, seed.mode);
+        const auto prior = explicit_returns.find(key);
+        if (prior != explicit_returns.end() && prior->second != seed.returns)
+            throw std::runtime_error("conflicting explicit returns policy");
+        explicit_returns[key] = seed.returns;
+        if (!seed.returns) nonreturn_keys_.insert(key);
+    }
     const std::size_t manual_seed_count = seeds_.size();
     std::unordered_set<uint64_t> manual_seed_keys;
     for (const auto& s : seeds_)
@@ -1994,6 +2019,10 @@ void FunctionFinder::run(std::size_t max_functions) {
                 s.source_addr = seed_it->second.source_addr;
             }
             s.private_entry = s.private_entry || seed_it->second.private_entry;
+            if (seed_it->second.returns_declared) {
+                s.returns = seed_it->second.returns;
+                s.returns_declared = true;
+            }
         }
 
         std::size_t before = functions_.size();

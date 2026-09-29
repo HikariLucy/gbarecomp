@@ -193,7 +193,8 @@ std::string emit_function_body_str(
     const std::unordered_map<uint64_t, std::string>& func_names_by_key,
     const std::unordered_set<uint32_t>*
         alu_immediate_override_pcs,
-    const std::unordered_set<uint64_t>* mod_function_hook_keys) {
+    const std::unordered_set<uint64_t>* mod_function_hook_keys,
+    const std::unordered_set<uint64_t>* nonreturn_target_keys) {
     std::string out;
 
     const uint32_t step = (fn.mode == CpuMode::Thumb) ? 2u : 4u;
@@ -394,7 +395,7 @@ std::string emit_function_body_str(
         // each one leaked a call-return entry until the 1024-entry abort).
         // Relocated bodies (source_addr != addr) keep call semantics: the
         // target bytes are not in this image at the target's guest address.
-        if (fn_source_addr == fn.addr) {
+        if (fn_source_addr == fn.addr || nonreturn_target_keys) {
             bool is_bl = false;
             uint32_t bl_target = 0;
             if (scan_ins.op == armv4t::IrOp::BL) {
@@ -410,9 +411,16 @@ std::string emit_function_body_str(
                 }
             }
             const uint32_t link = scan_pc + step;
+            const uint64_t target_key =
+                (static_cast<uint64_t>(bl_target) << 1u) |
+                (fn.mode == CpuMode::Thumb ? 1u : 0u);
+            const bool explicitly_nonreturning = is_bl && nonreturn_target_keys &&
+                nonreturn_target_keys->count(target_key) != 0;
             if (is_bl && bl_target != link &&
-                link_register_dead_at(rom, rom_size, rom_base, bl_target,
-                                      fn.mode == CpuMode::Thumb)) {
+                (explicitly_nonreturning ||
+                 (fn_source_addr == fn.addr &&
+                  link_register_dead_at(rom, rom_size, rom_base, bl_target,
+                                        fn.mode == CpuMode::Thumb)))) {
                 link_branch_targets[scan_pc] = bl_target;
                 if (bl_target >= fn.addr && bl_target < fn.end_addr &&
                     bl_target < scan_pc)
@@ -591,11 +599,13 @@ void emit_function_body(
     const std::unordered_map<uint64_t, std::string>& func_names_by_key,
     const std::unordered_set<uint32_t>*
         alu_immediate_override_pcs,
-    const std::unordered_set<uint64_t>* mod_function_hook_keys) {
+    const std::unordered_set<uint64_t>* mod_function_hook_keys,
+    const std::unordered_set<uint64_t>* nonreturn_target_keys) {
     std::string body = emit_function_body_str(fn, rom, rom_size, rom_base,
                                               func_names_by_key,
                                               alu_immediate_override_pcs,
-                                              mod_function_hook_keys);
+                                              mod_function_hook_keys,
+                                              nonreturn_target_keys);
     std::fwrite(body.data(), 1, body.size(), f);
 }
 

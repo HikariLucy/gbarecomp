@@ -44,6 +44,73 @@ const gbarecomp::Function* find_function(
 }  // namespace
 
 int main() {
+    // SoftReset closes both instruction sets; ordinary BIOS calls resume.
+    for (const bool thumb : {false, true}) {
+        std::vector<std::uint8_t> image(0x80, 0);
+        const auto mode = thumb ? gbarecomp::CpuMode::Thumb : gbarecomp::CpuMode::Arm;
+        const std::uint32_t step = thumb ? 2u : 4u;
+        for (const std::uint32_t swi_num : {0u, 1u, 0x11u}) {
+            if (thumb) put16(image, 0, static_cast<std::uint16_t>(0xDF00u | swi_num));
+            else put32(image, 0, 0xEF000000u | (swi_num << 16));
+            gbarecomp::FunctionFinder finder(image.data(), image.size(), kBase);
+            finder.set_speculative_literal_harvest(false);
+            finder.add_seed({kBase, mode, "swi_fixture"});
+            finder.add_data_range(kBase + step, kBase + step * 2u, "literal");
+            finder.run(8);
+            const auto* fn = find_function(finder, kBase, mode);
+            if (!fn || (swi_num == 0u ? !finder.collisions().empty() :
+                                           finder.collisions().empty()) ||
+                (swi_num == 0u && fn->end_addr != kBase + step)) {
+                std::fprintf(stderr, "SWI %u terminal policy wrong (%s)\n",
+                             swi_num, thumb ? "Thumb" : "ARM");
+                return 1;
+            }
+        }
+    }
+    // A non-returning ARM call must end the caller before the declared data.
+    {
+        std::vector<std::uint8_t> image(0x300, 0);
+        put32(image, 0x100, 0xEB00003Eu); // BL 0x08000200
+        put32(image, 0x200, 0xE321F013u); // MSR CPSR_c, #0x13 (LR analysis unknown)
+        put32(image, 0x204, 0xE12FFF10u); // BX r0
+        gbarecomp::FunctionFinder baseline(image.data(), image.size(), kBase);
+        baseline.set_speculative_literal_harvest(false);
+        baseline.add_seed({kBase + 0x100, gbarecomp::CpuMode::Arm, "caller"});
+        baseline.add_data_range(kBase + 0x104, kBase + 0x200, "literal bytes");
+        baseline.run(16);
+        if (baseline.collisions().empty()) {
+            std::fprintf(stderr, "ordinary BL failed to reproduce data collision\n");
+            return 1;
+        }
+        gbarecomp::FunctionFinder explicit_flow(image.data(), image.size(), kBase);
+        explicit_flow.set_speculative_literal_harvest(false);
+        explicit_flow.add_seed({kBase + 0x100, gbarecomp::CpuMode::Arm, "caller"});
+        gbarecomp::FunctionSeed callee{kBase + 0x200, gbarecomp::CpuMode::Arm, "callee"};
+        callee.returns = false;
+        callee.returns_declared = true;
+        explicit_flow.add_seed(callee);
+        explicit_flow.add_data_range(kBase + 0x104, kBase + 0x200, "literal bytes");
+        explicit_flow.run(16);
+        const auto* caller = find_function(explicit_flow, kBase + 0x100,
+                                           gbarecomp::CpuMode::Arm);
+        if (!explicit_flow.collisions().empty() || !caller ||
+            caller->end_addr != kBase + 0x104 ||
+            !has_function(explicit_flow, kBase + 0x200, gbarecomp::CpuMode::Arm)) {
+            std::fprintf(stderr, "non-returning BL crossed into data\n");
+            return 1;
+        }
+        gbarecomp::FunctionFinder conflicting(image.data(), image.size(), kBase);
+        conflicting.add_seed(callee);
+        callee.returns = true;
+        conflicting.add_seed(callee);
+        bool rejected = false;
+        try { conflicting.run(8); }
+        catch (const std::runtime_error&) { rejected = true; }
+        if (!rejected) {
+            std::fprintf(stderr, "contradictory returns declarations accepted\n");
+            return 1;
+        }
+    }
     std::vector<std::uint8_t> rom(0x80, 0);
 
     // ldr r1,[pc,#8]  -> tracker sees the even ROM data pointer below

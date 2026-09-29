@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -126,6 +127,49 @@ int main() {
         moved, rom.bytes.data(), rom.bytes.size(), kBase, names);
     check(contains(moved_body, "runtime_call_push_return(0x03000004u)"),
           "relocated BL must stay a call");
+
+    // An explicit non-returning target overrides conservative LR analysis.
+    const std::uint32_t caller = kBase + 0xB00u;
+    const std::uint32_t callee = kBase + 0xC00u;
+    rom.arm_bl(caller, callee);
+    rom.w(callee, 0xE321F013u); // MSR CPSR_c, #0x13: automatic proof unknown
+    rom.w(callee + 4u, 0xE12FFF10u); // BX r0
+    check(!rom.dead(callee, false), "MSR remains conservative");
+    gbarecomp::Function arm_caller{};
+    arm_caller.addr = caller;
+    arm_caller.source_addr = caller;
+    arm_caller.end_addr = caller + 4u;
+    arm_caller.mode = gbarecomp::CpuMode::Arm;
+    arm_caller.name = "caller";
+    const std::unordered_set<std::uint64_t> nonreturn_keys{
+        static_cast<std::uint64_t>(callee) << 1u};
+    const auto tail_body = gbarecomp::emit_function_body_str(
+        arm_caller, rom.bytes.data(), rom.bytes.size(), kBase, names,
+        nullptr, nullptr, &nonreturn_keys);
+    check(contains(tail_body, "g_cpu.R[14] = 0x08000B04u;"),
+          "non-returning BL must write guest LR");
+    check(contains(tail_body, "runtime_dispatch(0x08000C00u);"),
+          "non-returning BL must enter its target");
+    check(!contains(tail_body, "runtime_call_push_return(0x08000B04u)"),
+          "non-returning BL leaked a host call frame");
+    check(!contains(tail_body, "runtime_call_cancel_return(0x08000B04u)"),
+          "non-returning BL kept a guest continuation");
+
+    // The generated SoftReset block returns after BIOS dispatch. Ordinary
+    // SWIs retain that same host boundary and a finder continuation.
+    rom.h(kBase + 0xD00u, 0xDF00u); // Thumb SWI 0
+    gbarecomp::Function reset{};
+    reset.addr = kBase + 0xD00u;
+    reset.source_addr = reset.addr;
+    reset.end_addr = reset.addr + 2u;
+    reset.mode = gbarecomp::CpuMode::Thumb;
+    reset.name = "reset";
+    const auto reset_body = gbarecomp::emit_function_body_str(
+        reset, rom.bytes.data(), rom.bytes.size(), kBase, names);
+    check(contains(reset_body, "runtime_swi(0x00000000u);\n    return;"),
+          "SoftReset must leave its generated host body");
+    check(!contains(reset_body, "/* 08000D02"),
+          "generated SoftReset body decoded following data");
 
     if (failures) return 1;
     std::printf("link_branch_tests: OK\n");
