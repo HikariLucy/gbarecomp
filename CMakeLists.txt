@@ -908,6 +908,39 @@ if(Python3_Interpreter_FOUND AND UNIX)
         COMMAND indirect_call_return_runtime_tests "${ICR_FIXTURE_DIR}")
 endif()
 
+if(Python3_Interpreter_FOUND AND UNIX)
+    set(TD_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/tail_dispatch_fixture")
+    set(TD_GENERATED_DIR "${TD_FIXTURE_DIR}/generated")
+    add_custom_command(
+        OUTPUT
+            "${TD_GENERATED_DIR}/recompiled.h"
+            "${TD_GENERATED_DIR}/recompiled_000.cpp"
+            "${TD_GENERATED_DIR}/recompiled_001.cpp"
+            "${TD_GENERATED_DIR}/dispatch_table.cpp"
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/tail_dispatch/generate_fixture.py"
+            "$<TARGET_FILE:gba_recompile>"
+            "${TD_FIXTURE_DIR}"
+        DEPENDS gba_recompile
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/tail_dispatch/generate_fixture.py"
+        VERBATIM)
+    add_executable(tail_dispatch_runtime_tests
+        tests/recompile/tail_dispatch/runtime_test.cpp
+        "${TD_GENERATED_DIR}/recompiled_000.cpp"
+        "${TD_GENERATED_DIR}/recompiled_001.cpp"
+        "${TD_GENERATED_DIR}/dispatch_table.cpp")
+    target_include_directories(tail_dispatch_runtime_tests PRIVATE
+        "${TD_GENERATED_DIR}" src/armv4t src/gba src/runtime)
+    # Sibling-call optimisation would hide the growth at -O2 (and is absent from
+    # debug/sanitizer builds and from frames with destructors, e.g. the RAM hook).
+    if(NOT MSVC)
+        target_compile_options(tail_dispatch_runtime_tests PRIVATE -fno-optimize-sibling-calls)
+    endif()
+    target_link_gbarecomp_runtime_stack(tail_dispatch_runtime_tests)
+    add_test(NAME tail_dispatch_runtime_tests
+        COMMAND tail_dispatch_runtime_tests "${TD_FIXTURE_DIR}")
+endif()
+
 add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
 target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME function_finder_tests COMMAND function_finder_tests)
