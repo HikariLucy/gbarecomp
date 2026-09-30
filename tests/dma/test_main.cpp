@@ -377,6 +377,22 @@ void test_normal_dma_width_unchanged() {
     }
 }
 
+// IRQ-on-end still fires per burst when the width bit is clear (0xF200).
+void test_fifo_irq_with_width_bit_clear() {
+    TestBus bus;
+    gba::GbaIo io;
+    gba::GbaAudio audio;
+    io.set_bus(&bus);
+    io.set_audio(&audio);
+    fill_pattern(bus, 16);
+    arm_dma1(io, kFifoA, 4, 0xF200u);
+    start_timer0(io);
+    overflow(io);
+    check_eq("fifo_irq_dma1", io.if_reg() & gba::GbaIo::IrqDma1,
+             gba::GbaIo::IrqDma1);
+    check_eq("fifo_irq_raw_cnt_h", io.read16(0xC6u), 0xF200u);
+}
+
 }  // namespace
 
 int main() {
@@ -391,6 +407,7 @@ int main() {
     test_fifo_routing_follows_destination();
     test_fifo_timing_restricted_to_dma1_dma2();
     test_normal_dma_width_unchanged();
+    test_fifo_irq_with_width_bit_clear();
     if (failures) {
         std::printf("dma_tests: %d failure(s)\n", failures);
         return 1;
