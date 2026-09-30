@@ -60,8 +60,10 @@ void run_callee(Fn&& fn) {
 
 // The game's verified RAM hook: the LIVE bytes select the overlay image; the
 // GBARecomp side is handed an explicit image identity.
+int g_tail_hook_pcs = 0;
 int verified_hook(std::uint32_t pc, int thumb) {
     if (pc < 0x03001000u || pc >= 0x03001100u || !thumb) return 0;
+    if (pc == 0x03001080u) ++g_tail_hook_pcs;
     auto* bus = gbarecomp::active_bus();
     auto matches = [&](const std::vector<std::uint8_t>& img) {
         for (std::uint32_t i = 0; i < img.size(); ++i)
@@ -170,7 +172,7 @@ int main(int argc, char** argv) {
     check(runtime_invoke_private_entry_in_image(-1, 0x03001000u, 1) == 0, "unknown handle -1");
     check(runtime_invoke_private_entry_in_image(99, 0x03001000u, 1) == 0, "unknown handle 99");
     check(runtime_invoke_private_entry_in_image(g_handle_a, 0x03001000u, 0) == 0, "wrong mode");
-    check(runtime_invoke_private_entry_in_image(g_handle_a, 0x03001080u, 1) == 0, "no entry PC");
+    check(runtime_invoke_private_entry_in_image(g_handle_a, 0x030010C0u, 1) == 0, "no entry PC");
     check(runtime_invoke_private_entry_in_image(0, 0x03001000u, 1) == 0,
           "handle 0 (primary world) must not reach overlay bodies");
     check(runtime_invoke_private_entry(0x03001000u, 1) == 0,
@@ -193,6 +195,23 @@ int main(int argc, char** argv) {
         });
         check(g_cpu.R[0] == (who ? 3u : 2u) && g_cpu.R[5] == (who ? 0x21u : 0x1Eu),
               "resume after yield returned to the wrong image");
+    }
+
+    // ---- tail transfer inside an overlay image --------------------------
+    // hop (`bx r7`) is a TAIL transfer: it is re-resolved through the game's
+    // verified hook (live bytes choose the image) and must land in the SAME
+    // image's body at the same guest address, never the other image or public.
+    for (int who = 0; who < 2; ++who) {
+        load_ram(bus, who ? g_img_b : g_img_a);
+        g_tail_hook_pcs = 0;
+        run_callee([&] {
+            g_cpu.R[7] = 0x03001081u;
+            g_cpu.R[15] = 0x03001060u;
+            runtime_dispatch(0x03001061u);
+        });
+        check(g_cpu.R[4] == (who ? 0xB4u : 0xA4u), "tail transfer stayed in its own overlay image");
+        check(g_tail_hook_pcs == 1, "the tail target went through the verified hook");
+        check(!g_runtime_tail_pending, "no stale tail transfer after the dispatch");
     }
 
     // ---- IRQ inside an overlay body --------------------------------------

@@ -23,9 +23,29 @@ extern "C" const unsigned kBiosDispatchTableLen = 0u;
 
 namespace {
 std::uintptr_t g_low;
-int sample(std::uint32_t, int) {
+enum class Probe { None, Yield, Irq } g_probe = Probe::None;
+int g_b_entries = 0;     // calls of the predicate at B's entry PC (dispatch + prologue)
+int g_a_entries = 0;
+bool g_probe_fired = false;
+int sample(std::uint32_t pc, int) {
     const auto here = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     if (here < g_low) g_low = here;
+    if (g_probe == Probe::Yield && !g_probe_fired && pc == 0x08000100u && ++g_a_entries == 6) {
+        // Arm a VBlank-style yield at the next B prologue (runtime_should_yield honours it).
+        g_probe_fired = true;
+        g_runtime_break_pc = 0x08000140u;
+    }
+    if (g_probe == Probe::Irq && !g_probe_fired && pc == 0x08000140u && ++g_b_entries == 3) {
+        g_probe_fired = true;
+        // IRQ-style: a nested dispatch between two tail transfers of the chain.
+        const auto r14 = g_cpu.R[14];
+        const auto r15 = g_cpu.R[15];
+        const auto cpsr = g_cpu.cpsr;
+        g_cpu.R[14] = 0x08000004u;
+        runtime_call_push_return(0x08000004u);
+        runtime_dispatch(0x08000280u);
+        g_cpu.R[14] = r14; g_cpu.R[15] = r15; g_cpu.cpsr = cpsr;
+    }
     return 0;
 }
 int g_failures = 0;
@@ -43,9 +63,11 @@ void reset(gba::GbaBus& bus, std::uint32_t limit) {
     bus.write32(0x02000000u, 0x08000140u);
     bus.write32(0x02000004u, 0x08000100u);
     bus.write32(0x02000008u, 0x08000100u);
+    bus.write32(0x0200000Cu, 0x080002C0u);
     g_low = ~static_cast<std::uintptr_t>(0);
 }
-std::uintptr_t run(gba::GbaBus& bus, std::uint32_t entry, std::uint32_t limit) {
+// noinline: the baseline must be run()'s own frame, not main()'s (which holds the multi-hundred-KiB bus).
+__attribute__((noinline)) std::uintptr_t run(gba::GbaBus& bus, std::uint32_t entry, std::uint32_t limit) {
     reset(bus, limit);
     const std::uint32_t depth0 = runtime_call_stack_depth();
     runtime_call_push_return(0x08000000u);
@@ -94,6 +116,34 @@ int main(int argc, char** argv) {
     check(g_cpu.R[3] == 1u, "callee started before the continuation");
     check(g_cpu.R[5] == 30000u, "continuation observes the FINISHED tail chain");
     check(g_cpu.R[0] == 30000u, "guest result after return");
+
+    std::printf("== yield between tail transfers, then resume\n");
+    {
+        g_probe = Probe::Yield; g_a_entries = 0; g_probe_fired = false;
+        reset(bus, 1000u);
+        runtime_call_push_return(0x08000000u);
+        runtime_dispatch(0x08000100u);
+        g_runtime_break_pc = 0;
+        check(g_probe_fired && g_cpu.R[15] == 0x08000140u, "yield stopped at the guest PC of the next tail target");
+        const std::uint32_t progress = g_cpu.R[0];
+        check(progress >= 3u && progress < 1000u, "the yield interrupted the chain part-way");
+        check(!g_runtime_tail_pending, "no stale tail transfer after the yield");
+        g_probe = Probe::None;
+        runtime_dispatch(g_cpu.R[15]);                  // the outer loop re-dispatches R15
+        check(g_cpu.R[0] == 1000u, "resumed run reaches the same guest result as an uninterrupted one (no step lost or repeated)");
+        check(!g_runtime_tail_pending, "no stale tail transfer after the resume");
+    }
+
+    std::printf("== nested dispatch (IRQ-style) in the middle of a chain\n");
+    {
+        g_probe = Probe::Irq; g_b_entries = 0; g_probe_fired = false;
+        const std::uintptr_t hw_irq = run(bus, 0x08000100u, 30000u);
+        g_probe = Probe::None;
+        check(g_probe_fired, "the nested dispatch ran");
+        check(g_cpu.R[9] == 2u, "handler ran once, including its own tail transfer");
+        check(g_cpu.R[0] == 30000u, "interrupted chain still completes with the exact guest result");
+        check(hw_irq < 256u * 1024u, "high-water stays bounded with a nested dispatch");
+    }
 
     std::printf("tail_dispatch_runtime_tests: %s\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;

@@ -56,6 +56,10 @@ def image(marker, addend, with_literal):
         hi = 0xF000 | ((off >> 12) & 0x7FF)
         lo = 0xF800 | ((off >> 1) & 0x7FF)
         img[0x40:0x48] = thumb(0xB500, hi, lo, 0xBD00)
+    # Tail transfer inside the image: hop @+0x60 `bx r7` (r7 = 0x03001081), dest @+0x80
+    # `movs r4,#0xA4|0xB4 ; bx lr`. Both images hold it at the same guest address.
+    img[0x60:0x62] = thumb(0x4738)
+    img[0x80:0x84] = thumb(0x2400 | (0xB4 if with_literal else 0xA4), 0x4770)
     return img
 
 
@@ -135,6 +139,30 @@ name = "a_f3"
 dispatch = false
 image = "img_a"
 [[extra_func]]
+addr = 0x03001060
+mode = "thumb"
+name = "a_hop"
+dispatch = false
+image = "img_a"
+[[extra_func]]
+addr = 0x03001080
+mode = "thumb"
+name = "a_dest"
+dispatch = false
+image = "img_a"
+[[extra_func]]
+addr = 0x03001060
+mode = "thumb"
+name = "b_hop"
+dispatch = false
+image = "img_b"
+[[extra_func]]
+addr = 0x03001080
+mode = "thumb"
+name = "b_dest"
+dispatch = false
+image = "img_b"
+[[extra_func]]
 addr = 0x03001000
 mode = "thumb"
 name = "b_root"
@@ -154,7 +182,8 @@ header = (out / 'recompiled.h').read_text()
 table = (out / 'dispatch_table.cpp').read_text()
 public_table, private_table = table.split('kPrivateDispatchTable[]', 1)
 body = ''.join(path.read_text() for path in sorted(out.glob('recompiled_*.cpp')))
-for name in ('gf_pub_ram', 'gf_pub_q', 'gf_a_root', 'gf_a_f2', 'gf_a_f3', 'gf_b_root'):
+for name in ('gf_pub_ram', 'gf_pub_q', 'gf_a_root', 'gf_a_f2', 'gf_a_f3', 'gf_b_root',
+             'gf_a_hop', 'gf_a_dest', 'gf_b_hop', 'gf_b_dest'):
     assert name + '(void)' in header, name
 # Public table holds exactly the public 0x03001000 body, never an overlay body.
 assert 'gf_pub_ram' in public_table and 'gf_a_root' not in public_table
@@ -186,4 +215,7 @@ assert re.search(r'\{0x03001020u, 1u, 0u, 1u, gf_a_f2\}', private_table)
 assert 'uint16_t image' in table
 # A's call into the public world goes to the public body by name.
 assert 'runtime_dispatch(_blt_' in fn_body('gf_a_f3')  # public call, by address
+# An in-image indirect transfer (bx r7) is a TAIL transfer, never a nested dispatch.
+assert 'runtime_dispatch_with_exchange_tail(' in fn_body('gf_a_hop')
+assert 'runtime_dispatch_with_exchange(' not in fn_body('gf_a_hop')
 print('fixture generated')

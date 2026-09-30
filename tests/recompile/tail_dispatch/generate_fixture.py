@@ -11,6 +11,8 @@ caller2 @0x240  mov r4,lr ; bl callee2 ; mov r3,r2 ; mov r5,r0 ; mov lr,r4 ; bx 
 callee2 @0x200  mov r2,#1 ; ldr pc,[r11,#8]     (-> A)
     a CALL whose callee performs thousands of TAIL transfers before it returns:
     the continuation must observe the finished chain (r5 == r1).
+irq_h @0x280 / irq_h2 @0x2C0: a handler run by a nested dispatch in the middle of a
+chain; it tail-transfers once and returns (r9 counts its instructions).
 """
 import hashlib
 import pathlib
@@ -37,9 +39,14 @@ rom[0x180:0x198] = arm(0xE1A0400E, bl(0x184, 0x1C0), 0xE1A03002, 0xE2800C01, 0xE
 rom[0x1C0:0x1D0] = arm(0xE3A02001, 0xE2800001, 0xE1A0600E, 0xE12FFF1E)
 rom[0x200:0x208] = arm(0xE3A02001, 0xE59BF008)
 rom[0x240:0x258] = arm(0xE1A0400E, bl(0x244, 0x200), 0xE1A03002, 0xE1A05000, 0xE1A0E004, 0xE12FFF1E)
+# irq_h @0x280: add r9,r9,#1 ; ldr pc,[r11,#12]   (a handler that itself tail-transfers)
+# irq_h2 @0x2C0: add r9,r9,#1 ; bx lr
+rom[0x280:0x288] = arm(0xE2899001, 0xE59BF00C)
+rom[0x2C0:0x2C8] = arm(0xE2899001, 0xE12FFF1E)
 (root / 'fixture.gba').write_bytes(rom)
 funcs = [(0x100, 'chain_a'), (0x140, 'chain_b'), (0x180, 'caller'), (0x1C0, 'callee'),
-         (0x200, 'callee2'), (0x240, 'caller2')]
+         (0x200, 'callee2'), (0x240, 'caller2'),
+         (0x280, 'irq_h'), (0x2C0, 'irq_h2')]
 extra = ''.join(f'[[extra_func]]\naddr = 0x{0x08000000 + a:08X}\nmode = "arm"\nname = "{n}"\n' for a, n in funcs)
 (root / 'fixture.toml').write_text(f'''[program]
 load_address = 0x08000000
