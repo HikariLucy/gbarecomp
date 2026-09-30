@@ -290,7 +290,8 @@ private:
     // Count an unknown / unhandled IO access. Per-access diagnostics are
     // quiet by default and bounded when GBARECOMP_VERBOSE_IO_WARNINGS is set.
     void warn_unhandled(uint32_t off, uint32_t value, bool is_write, uint8_t width);
-    void run_sound_fifo_dma(int channel);
+    void run_sound_fifo_dma(int fifo_id);
+    void service_sound_fifo_dma(int channel, uint16_t cnt_h);
 };
 
 }  // namespace gba

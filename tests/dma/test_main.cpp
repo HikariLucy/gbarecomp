@@ -306,7 +306,7 @@ void test_fifo_routing_follows_destination() {
     io.set_audio(&audio);
     fill_pattern(bus, 16);
     io.write16(0x84u, 0x0080u);   // SOUNDCNT_X: master enable
-    io.write16(0x82u, 0x0404u);   // FIFO A uses timer 1, FIFO B uses timer 0
+    io.write16(0x82u, 0x0400u);   // FIFO A uses timer 1, FIFO B uses timer 0
     arm_dma1(io, kFifoB, 4, 0xB200u);
     arm_dma2(io, kFifoA, 4, 0xB200u);
     start_timer0(io);

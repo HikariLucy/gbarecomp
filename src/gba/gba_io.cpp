@@ -390,14 +390,31 @@ void GbaIo::run_timed_dma(int start_mode) {
     }
 }
 
-void GbaIo::run_sound_fifo_dma(int channel) {
-    if (!bus_ || channel < 1 || channel > 2) return;
-    uint32_t base = 0xB0u + static_cast<uint32_t>(channel) * 12u;
-    uint16_t cnt_h = load_u16(&io_[base + 10]);
-    if ((cnt_h & 0x8000u) == 0) return;
-    if (((cnt_h >> 12) & 0x3u) != 3) return;
-    if ((cnt_h & 0x0400u) == 0) return;
+// Sound-FIFO DMA request (GBATEK "Sound DMA (FIFO Mode)"). Start timing 3 on
+// DMA1/DMA2 means "serve a direct-sound FIFO". In that mode the controller
+// ignores CNT_H bit 10 (always 32-bit), the destination control (destination is
+// the fixed FIFO register) and CNT_L (always a 4-word burst); the register file
+// keeps whatever the game wrote. `fifo_id` selects which FIFO is asking; the
+// serving channel is whichever armed DMA1/DMA2 points at that FIFO's address,
+// not simply "channel 1 = A, channel 2 = B".
+void GbaIo::run_sound_fifo_dma(int fifo_id) {
+    if (!bus_ || fifo_id < 0 || fifo_id > 1) return;
+    const uint32_t fifo_addr = 0x040000A0u + static_cast<uint32_t>(fifo_id) * 4u;
+    for (int channel = 1; channel <= 2; ++channel) {
+        uint32_t base = 0xB0u + static_cast<uint32_t>(channel) * 12u;
+        uint16_t cnt_h = load_u16(&io_[base + 10]);
+        if ((cnt_h & 0x8000u) == 0) continue;
+        if (((cnt_h >> 12) & 0x3u) != 3) continue;
+        uint32_t dad_reg = dma_next_dest_[channel] ?
+            dma_next_dest_[channel] : load_u32(&io_[base + 4]);
+        if ((dad_reg & ~3u) != fifo_addr) continue;
+        service_sound_fifo_dma(channel, cnt_h);
+        return;
+    }
+}
 
+void GbaIo::service_sound_fifo_dma(int channel, uint16_t cnt_h) {
+    uint32_t base = 0xB0u + static_cast<uint32_t>(channel) * 12u;
     uint32_t sad = dma_next_source_[channel] ?
         dma_next_source_[channel] : (load_u32(&io_[base + 0]) & 0x0FFFFFFFu);
     uint32_t dad = dma_next_dest_[channel] ?
@@ -423,6 +440,12 @@ void GbaIo::run_sound_fifo_dma(int channel) {
     }
     dma_next_source_[channel] = s;
     dma_next_dest_[channel] = dad;
+
+    // Like any DMA, a channel without CNT_H.repeat disables itself after its
+    // transfer. Games normally set repeat so the channel stays armed.
+    if ((cnt_h & 0x0200u) == 0) {
+        store_u16(&io_[base + 10], static_cast<uint16_t>(cnt_h & ~0x8000u));
+    }
 
     // A sound-FIFO request is still a complete DMA transfer: hardware raises
     // the channel's completion IRQ after each four-word burst when CNT_H.IRQ
@@ -482,10 +505,10 @@ void GbaIo::tick_timers(uint32_t cycles) {
                 bool refill_b = t == fifo_b_timer && audio_->fifo_needs_dma(1);
                 audio_->timer_overflow(t);
                 if (refill_a) {
-                    run_sound_fifo_dma(1);
+                    run_sound_fifo_dma(0);
                 }
                 if (refill_b) {
-                    run_sound_fifo_dma(2);
+                    run_sound_fifo_dma(1);
                 }
             }
         }
