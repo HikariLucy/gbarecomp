@@ -114,10 +114,12 @@ int main() {
           "far-branch BL kept call fallthrough");
     check(contains(body, "g_cpu.R[14] = 0x08000005u;"),
           "far-branch BL must still write LR");
-    check(contains(body, "runtime_dispatch(0x08000100u);"),
-          "far-branch BL must transfer to its target");
+    check(contains(body, "runtime_dispatch_tail(0x08000100u);"),
+          "far-branch BL must transfer to its target as a TAIL transfer (no nesting)");
     check(contains(body, "runtime_call_push_return(0x08000008u)"),
           "real call lost its call-return frame");
+    check(contains(body, "runtime_dispatch(_blt"),
+          "a real call must stay a driver call (runtime_dispatch), never a tail transfer");
 
     // Relocated bodies keep call semantics.
     gbarecomp::Function moved = fn;
@@ -148,8 +150,8 @@ int main() {
         nullptr, nullptr, &nonreturn_keys);
     check(contains(tail_body, "g_cpu.R[14] = 0x08000B04u;"),
           "non-returning BL must write guest LR");
-    check(contains(tail_body, "runtime_dispatch(0x08000C00u);"),
-          "non-returning BL must enter its target");
+    check(contains(tail_body, "runtime_dispatch_tail(0x08000C00u);"),
+          "non-returning BL must enter its target as a TAIL transfer (no nesting)");
     check(!contains(tail_body, "runtime_call_push_return(0x08000B04u)"),
           "non-returning BL leaked a host call frame");
     check(!contains(tail_body, "runtime_call_cancel_return(0x08000B04u)"),

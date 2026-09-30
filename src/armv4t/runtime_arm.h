@@ -159,6 +159,39 @@ void arm_set_nzcv_sbc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
 
 void runtime_dispatch(uint32_t target_pc);
 void runtime_dispatch_with_exchange(uint32_t target_pc);
+
+// ── Tail dispatch (guest TAIL transfers must not grow the host stack) ─────
+// A guest transfer that never comes back to the instruction after it (a plain
+// `b`, `bx`, `ldr pc`, `mov pc`, `ldm {..pc}` that is not a recorded return,
+// or the fall-through into the next function) is emitted as
+//     runtime_dispatch_tail(target); return;
+// instead of the nested `runtime_dispatch(target); return;`.
+//
+// Contract:
+//  * runtime_dispatch is the DRIVER. Every call opens a driver level; it runs
+//    the target and then every transfer published by runtime_dispatch_tail
+//    while it ran, in order, one at a time, each through the normal dispatch
+//    path (per-PC hooks, RAM/private resolvers, byte gates, table lookup).
+//    It returns only when no transfer is pending.
+//  * runtime_dispatch_tail never runs the target. It records {PC} (the mode is
+//    the live CPSR.T, exactly as for runtime_dispatch) on the innermost driver
+//    level and returns; the caller must `return;` immediately. With no driver
+//    level active it falls back to a nested runtime_dispatch. If the guest has
+//    been suspended (yield/stop) nothing is recorded.
+//  * A generated CALL (bl) that enters its callee by a direct host call calls
+//    runtime_tail_drain() right after the callee returns, so the callee's tail
+//    chain completes inside the call, before the continuation. Code that calls
+//    generated functions directly and then inspects the result (hooks that
+//    observe a helper's exit) must do the same.
+//  * All guest-visible state (PC in g_cpu.R[15], CPSR, LR, the call-return
+//    stack) is set by the generated code before the tail call; the pending
+//    record carries no other state, so a yield or a nested IRQ (which opens its
+//    own driver level) cannot corrupt it. g_runtime_tail_pending mirrors "the
+//    innermost level has a pending transfer" for cheap checks in generated code.
+void runtime_dispatch_tail(uint32_t target_pc);
+void runtime_dispatch_with_exchange_tail(uint32_t target_pc);
+void runtime_tail_drain(void);
+extern bool g_runtime_tail_pending;
 void runtime_dispatch_miss(uint32_t target_pc);
 
 // Whole-program force-interpreter backend (co-simulation "interp" side). When

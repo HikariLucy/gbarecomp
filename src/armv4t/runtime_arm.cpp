@@ -847,7 +847,74 @@ constexpr uint32_t kBiosRegionEnd = 0x00004000u;
 
 }  // namespace
 
+namespace {
+// One record per active driver level (runtime_dispatch activation). A tail
+// transfer is published on the innermost level and consumed by that level's loop.
+struct TailFrame { TailFrame* prev; uint32_t pc; };
+TailFrame* g_tail_top = nullptr;
+
+struct TailScope {
+    TailFrame frame;
+    bool saved_pending;
+    TailScope() {
+        frame.prev = g_tail_top;
+        frame.pc = 0u;
+        saved_pending = g_runtime_tail_pending;
+        g_runtime_tail_pending = false;
+        g_tail_top = &frame;
+    }
+    // Also runs on exceptions (frontier observers unwind by throwing): the
+    // abandoned level's record dies with it and the outer flag is restored.
+    ~TailScope() {
+        g_tail_top = frame.prev;
+        g_runtime_tail_pending = saved_pending;
+    }
+};
+
+void dispatch_once(uint32_t target_pc);
+
+// Consume transfers published on the innermost level, one at a time.
+void drain_innermost() {
+    while (g_runtime_tail_pending) {
+        g_runtime_tail_pending = false;
+        dispatch_once(g_tail_top->pc);
+    }
+}
+}  // namespace
+
+extern "C" bool g_runtime_tail_pending = false;
+
 extern "C" void runtime_dispatch(uint32_t target_pc) {
+    TailScope scope;
+    dispatch_once(target_pc);
+    drain_innermost();
+}
+
+extern "C" void runtime_tail_drain(void) {
+    if (g_runtime_tail_pending) drain_innermost();
+}
+
+extern "C" void runtime_dispatch_tail(uint32_t target_pc) {
+    if (gbarecomp::runtime_dispatch_suspended()) return;
+    if (!g_tail_top) { runtime_dispatch(target_pc); return; }
+    // A second transfer while one is pending cannot come from generated code (a
+    // tail site is followed by `return`); keep guest order if a hook does it.
+    if (g_runtime_tail_pending) drain_innermost();
+    g_tail_top->pc = target_pc;
+    g_runtime_tail_pending = true;
+}
+
+extern "C" void runtime_dispatch_with_exchange_tail(uint32_t target_pc) {
+    if (target_pc & 1u) g_cpu.cpsr |= CPSR_T_BIT;
+    else                g_cpu.cpsr &= ~CPSR_T_BIT;
+    if (runtime_trace_enabled())
+        runtime_trace_event(RUNTIME_TRACE_EXCHANGE, target_pc & ~1u, target_pc,
+                            0, 0);
+    runtime_dispatch_tail(target_pc);
+}
+
+namespace {
+void dispatch_once(uint32_t target_pc) {
     // A generated caller can fall through to another dispatch when the yielded
     // PC equals its return address. Do not enter that target or its RAM hook.
     if (gbarecomp::runtime_dispatch_suspended()) return;
@@ -912,6 +979,7 @@ extern "C" void runtime_dispatch(uint32_t target_pc) {
     }
     runtime_dispatch_miss(target_pc);
 }
+}  // namespace
 
 extern "C" void runtime_dispatch_with_exchange(uint32_t target_pc) {
     // Bit 0 of target indicates THUMB.
