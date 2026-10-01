@@ -235,6 +235,25 @@ struct RunOptions {
     int (*ui_get_text)(const char* key, char* buf, std::size_t buf_len) = nullptr;
     int (*ui_set_text)(const char* key, const char* value) = nullptr;
 
+    // ---- host display enhancements (display_settings.h) ---------------------
+    // Opt-in, PRESENTATION ONLY. When true the runtime menu gains Display /
+    // Graphics / Performance entries (aspect, integer scaling, filtering,
+    // vsync, CRT Lite, scanline strength, colour correction, FPS readouts),
+    // the choices persist in config.ini [Display], and F10 toggles a developer
+    // overlay. None of it reaches guest state, timing or the emulation clock;
+    // the guest still advances at the GBA's native 59.7275 Hz. False (the
+    // default) leaves every existing game's menu and rendering untouched.
+    bool expose_display_enhancements = false;
+    // Hold the guest still while the runtime menu is open (same path as the
+    // pause hotkey: the window keeps pumping events and re-presenting, no
+    // samples are pushed, the pacer is realigned on resume). False keeps the
+    // historical behaviour where the guest keeps running behind the menu.
+    bool pause_when_menu_open = false;
+    // Optional runtime-menu header text (default: game name / "Game Boy
+    // Advance runtime settings"). Must outlive run_game().
+    const char* runtime_menu_title = nullptr;
+    const char* runtime_menu_subtitle = nullptr;
+
     // Requests recomp-ui's physically-small/high-density touch presentation:
     // near-full-screen panels, larger hit targets, and touch-oriented footer
     // copy. False preserves the desktop/TV presentation for existing games.

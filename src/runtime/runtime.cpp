@@ -236,6 +236,14 @@ struct Args {
 #define GBARECOMP_UI_KEY_FAST_FORWARD   "assist.fast_forward"
 #define GBARECOMP_UI_KEY_FAST_FORWARD_SPEED "assist.fast_forward_speed"
 #define GBARECOMP_UI_KEY_REWIND          "assist.rewind"
+// Host display enhancements (RunOptions::expose_display_enhancements).
+#define GBARECOMP_UI_KEY_ASPECT          "display.aspect"
+#define GBARECOMP_UI_KEY_DISPLAY_RESET   "display.reset_defaults"
+#define GBARECOMP_UI_KEY_VSYNC           "performance.vsync"
+#define GBARECOMP_UI_KEY_PERF_OVERLAY    "performance.overlay"
+#define GBARECOMP_UI_KEY_CRT             "graphics.crt"
+#define GBARECOMP_UI_KEY_SCANLINES       "graphics.scanline_strength"
+#define GBARECOMP_UI_KEY_COLOR_PROFILE   "graphics.color_profile"
 
 struct RuntimeUiContext {
     HostWindow* window = nullptr;
@@ -256,6 +264,8 @@ struct RuntimeUiContext {
     int fast_forward_multiplier = 4;
     // Game-supplied handlers for keys the engine does not own.
     const RunOptions* opts = nullptr;
+    // RunOptions::expose_display_enhancements: persist [Display] on change.
+    bool display_enhancements = false;
 };
 
 int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
@@ -269,6 +279,21 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) *out = c->window->volume();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_STATE_SLOT) == 0) *out = c->state_slot;
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_FPS) == 0) *out = c->window->fps_readout();
+    else if (c->display_enhancements &&
+             std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0)
+        *out = c->window->display_settings().scale_mode == ScaleMode::IntegerFit;
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_ASPECT) == 0)
+        *out = static_cast<int>(c->window->display_settings().aspect);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_VSYNC) == 0)
+        *out = c->window->vsync();
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_PERF_OVERLAY) == 0)
+        *out = c->window->perf_overlay();
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_CRT) == 0)
+        *out = c->window->display_settings().crt_enabled;
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_SCANLINES) == 0)
+        *out = c->window->display_settings().scanline_strength;
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_COLOR_PROFILE) == 0)
+        *out = static_cast<int>(c->window->display_settings().color_profile);
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_ASSIST_ENABLED) == 0)
         *out = c->assist_tools_enabled;
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_FAST_FORWARD) == 0)
@@ -305,6 +330,21 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
         c->state_slot = std::clamp(value, 1, c->state_slot_count);
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_FPS) == 0)
         c->window->set_fps_readout(value != 0);
+    else if (c->display_enhancements &&
+             std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0)
+        c->window->set_scale_mode(value ? ScaleMode::IntegerFit : ScaleMode::Fit);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_ASPECT) == 0)
+        c->window->set_aspect_mode(value ? AspectMode::Stretch : AspectMode::Native);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_VSYNC) == 0)
+        c->window->set_vsync(value != 0);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_PERF_OVERLAY) == 0)
+        c->window->set_perf_overlay(value != 0);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_CRT) == 0)
+        c->window->set_crt_enabled(value != 0);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_SCANLINES) == 0)
+        c->window->set_scanline_strength(value);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_COLOR_PROFILE) == 0)
+        c->window->set_color_profile(value ? ColorProfile::GbaLike : ColorProfile::Off);
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_ASSIST_ENABLED) == 0) {
         c->assist_tools_enabled = value != 0;
         if (!c->assist_tools_enabled) c->fast_forward_latched = false;
@@ -349,8 +389,19 @@ int runtime_ui_action(void* opaque, const RecompRuntimeUiItem* item) {
         recomp_runtime_ui_close(c->ui);
         return 1;
     }
+    if (c->display_enhancements &&
+        std::strcmp(item->key, GBARECOMP_UI_KEY_DISPLAY_RESET) == 0) {
+        c->window->set_display_settings(DisplaySettings{});
+        c->window->save_display_settings();
+        return 1;
+    }
     if (c->opts && c->opts->ui_action) return c->opts->ui_action(item->key);
     return 0;
+}
+
+void runtime_ui_save(void* opaque) {
+    auto* c = static_cast<RuntimeUiContext*>(opaque);
+    if (c && c->display_enhancements && c->window) c->window->save_display_settings();
 }
 
 #if defined(RECOMP_RUNTIME_UI_HAS_TEXT)
@@ -378,6 +429,14 @@ int runtime_ui_enabled(void* opaque, const RecompRuntimeUiItem* item) {
     if (!c || !item) return 1;
     if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE) == 0)
         return c->window->fullscreen() == 0;
+    if (c->display_enhancements) {
+        const DisplaySettings ds = c->window->display_settings();
+        // Integer scaling is meaningless while the image is stretched to fill.
+        if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0)
+            return ds.aspect == AspectMode::Native;
+        if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCANLINES) == 0)
+            return ds.crt_enabled;
+    }
     if (c->assist_tools_exposed &&
         std::strcmp(item->key, GBARECOMP_UI_KEY_ASSIST_ENABLED) != 0 &&
         (std::strncmp(item->key, "assist.", 7) == 0 ||
@@ -2911,8 +2970,19 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (args.fullscreen) win.set_fullscreen(args.fullscreen);
         win.set_volume(args.volume);
         win.set_fps_readout(opts.show_fps_by_default);
+        if (opts.expose_display_enhancements) {
+            // Persisted [Display] choices win over the launcher's initial
+            // window flags (delete the section or use the menu's "Restore
+            // display defaults" to return to them). Invalid values are
+            // ignored key by key.
+            if (win.load_display_settings())
+                std::fprintf(stderr, "[gbarecomp:runtime] display settings loaded from config.ini\n");
+            win.set_perf_overlay_hotkey(true);
+            win.set_esc_closes_menu(true);
+        }
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
+        runtime_ui_context.display_enhancements = opts.expose_display_enhancements;
         runtime_ui_context.gyro_sensitivity = &args.gyro_sensitivity;
         runtime_ui_context.assist_tools_exposed = opts.expose_assist_tools;
         runtime_ui_context.assist_tools_enabled =
@@ -2938,8 +3008,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         };
 #endif
         RecompRuntimeUiStandardConfig runtime_ui_config{};
-        runtime_ui_config.menu.title = runtime_title;
-        runtime_ui_config.menu.subtitle = "Game Boy Advance runtime settings";
+        runtime_ui_config.menu.title =
+            opts.runtime_menu_title ? opts.runtime_menu_title : runtime_title;
+        runtime_ui_config.menu.subtitle =
+            opts.runtime_menu_subtitle ? opts.runtime_menu_subtitle
+                                       : "Game Boy Advance runtime settings";
         runtime_ui_config.menu.theme = "gba";
 #if defined(RECOMP_RUNTIME_UI_HAS_PRESENTATION_FLAGS)
         if (opts.ui_touch_friendly) {
@@ -2952,6 +3025,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         runtime_ui_config.menu.callbacks.set_value = runtime_ui_set;
         runtime_ui_config.menu.callbacks.run_action = runtime_ui_action;
         runtime_ui_config.menu.callbacks.is_enabled = runtime_ui_enabled;
+        runtime_ui_config.menu.callbacks.save = runtime_ui_save;
 #if defined(RECOMP_RUNTIME_UI_HAS_TEXT)
         runtime_ui_config.menu.callbacks.get_text = runtime_ui_get_text;
         runtime_ui_config.menu.callbacks.set_text = runtime_ui_set_text;
@@ -2975,6 +3049,13 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
             RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE;
 #endif
+        if (opts.expose_display_enhancements) {
+            // Integer scaling now has a real fractional mode to switch off
+            // (Fit), and the window-size presets stop at 6x.
+            runtime_ui_config.features |=
+                RECOMP_RUNTIME_UI_STANDARD_INTEGER_SCALE;
+            runtime_ui_config.window_scale_max = kMaxWindowScale;
+        }
         runtime_ui_config.view_modes = RECOMP_RUNTIME_UI_VIEW_MODE_NATIVE;
         if (opts.launcher_expose_widescreen && opts.max_view_width > 240)
             runtime_ui_config.view_modes |=
@@ -3071,11 +3152,51 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 
         RecompRuntimeUiItem fps_item{};
         fps_item.key         = GBARECOMP_UI_KEY_FPS;
-        fps_item.section     = "Display";
+        fps_item.section     = opts.expose_display_enhancements
+                                   ? "Performance" : "Display";
         fps_item.label       = "Show FPS";
-        fps_item.description = "Presents-per-second in the window title bar.";
+        fps_item.description = opts.expose_display_enhancements
+            ? "EMU (guest) and PRESENT (host) rates in the window title."
+            : "Presents-per-second in the window title bar.";
         fps_item.type        = RECOMP_RUNTIME_UI_BOOL;
         runtime_ui_extras.push_back(fps_item);
+
+        if (opts.expose_display_enhancements) {
+            static const char* const kAspectChoices[] = {"Native 3:2", "Stretch"};
+            static const char* const kColorChoices[] = {"Off", "GBA-like (approx.)"};
+            auto add = [&](const char* key, const char* section, const char* label,
+                           const char* desc, RecompRuntimeUiItemType type, int mn,
+                           int mx, int step, const char* const* choices = nullptr,
+                           std::size_t n = 0) {
+                RecompRuntimeUiItem it{};
+                it.key = key; it.section = section; it.label = label;
+                it.description = desc; it.type = type; it.minimum = mn;
+                it.maximum = mx; it.step = step; it.choices = choices;
+                it.choice_count = n;
+                runtime_ui_extras.push_back(it);
+            };
+            add(GBARECOMP_UI_KEY_ASPECT, "Display", "Aspect ratio",
+                "Native keeps the GBA's 3:2 (letter/pillarbox). Stretch fills the window and distorts the image.",
+                RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, kAspectChoices, 2);
+            add(GBARECOMP_UI_KEY_DISPLAY_RESET, "Display", "Restore display defaults",
+                "Reset every display and graphics option on this page to its default.",
+                RECOMP_RUNTIME_UI_ACTION, 0, 0, 0);
+            add(GBARECOMP_UI_KEY_CRT, "Graphics", "CRT Lite",
+                "Subtle scanlines over the final image (needs a window at least 2x). Presentation only.",
+                RECOMP_RUNTIME_UI_BOOL, 0, 1, 1);
+            add(GBARECOMP_UI_KEY_SCANLINES, "Graphics", "Scanline strength",
+                "0-100%. Capped so the image always stays readable.",
+                RECOMP_RUNTIME_UI_INT, kMinScanlineStrength, kMaxScanlineStrength, 5);
+            add(GBARECOMP_UI_KEY_COLOR_PROFILE, "Graphics", "Color correction",
+                "GBA-like is an approximation from published panel measurements, not an exact LCD emulation.",
+                RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, kColorChoices, 2);
+            add(GBARECOMP_UI_KEY_VSYNC, "Performance", "VSync",
+                "Synchronise buffer swaps to the monitor. Does not change game speed; on high-refresh monitors it can cost frame budget.",
+                RECOMP_RUNTIME_UI_BOOL, 0, 1, 1);
+            add(GBARECOMP_UI_KEY_PERF_OVERLAY, "Performance", "Performance overlay",
+                "EMU/PRESENT rates, frame time, audio underruns and strict-static counters (F10).",
+                RECOMP_RUNTIME_UI_BOOL, 0, 1, 1);
+        }
 
         if (opts.ui_extra_items && opts.ui_extra_item_count) {
             const auto* game_items =
@@ -3671,7 +3792,13 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     }
                 }
                 if (phase_active) fp_t1 = FramePhaseRing::now_ns();
-                if (present_frame) win.present(live_fb.data());
+                if (present_frame) {
+                    win.note_emulated_frames(ppu.frame_count());
+                    if (win.perf_overlay())
+                        win.set_perf_strict_counters(self_heal_distinct_misses(),
+                                                     self_heal_interpreted_insns());
+                    win.present(live_fb.data());
+                }
                 if (phase_active) fp_t2 = FramePhaseRing::now_ns();
                 int16_t audio_buf[2048];
                 std::size_t n = bus.audio().drain_samples(audio_buf, 2048);
@@ -3973,6 +4100,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         });
     }
 
+    auto menu_pauses_guest = [&]() -> bool {
+#if defined(GBARECOMP_RUNTIME_UI)
+        return opts.pause_when_menu_open && runtime_ui_context.ui &&
+               recomp_runtime_ui_is_open(runtime_ui_context.ui);
+#else
+        return false;
+#endif
+    };
     int dispatches_since_pump = 0;
     // Battery-save auto-flush debounce (see the loop body). ~1 s at 59.7 Hz.
     constexpr uint64_t kSaveFlushIntervalFrames = 60;
@@ -3983,11 +4118,23 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     for (uint64_t i = 0; i < step_budget && !host_quit; ++i) {
         // Paused: hold the guest still, keep the window alive (input pump,
         // re-present, ~100 Hz idle). Applies to windowed play only.
-        while (host_paused && !host_quit && args.window) {
+        // RunOptions::pause_when_menu_open additionally holds the guest while
+        // the runtime menu is open, through this same path.
+        bool paused_by_menu = false;
+        while ((host_paused || menu_pauses_guest()) && !host_quit && args.window) {
+            if (!host_paused) paused_by_menu = true;
+            win.set_guest_held(true);
             pump_host_input();
+            // While held the guest frame count is flat, so EMU reads 0 and
+            // PRESENT keeps ticking: the two rates are genuinely separate.
+            win.note_emulated_frames(ppu.frame_count());
             win.present(live_fb.data());
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        // Realign the pacer so resuming does not burn the wall-clock lag
+        // accumulated while the menu was up (hotkey pause does this itself).
+        win.set_guest_held(false);
+        if (paused_by_menu && pacer) pacer->reset();
         if (host_quit) break;
         if (!step_once()) break;
         if (input_replay_requested) {
@@ -4070,7 +4217,13 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     }
                 }
                 if (phase_active) fp_t1 = FramePhaseRing::now_ns();
-                if (present_frame) win.present(live_fb.data());
+                if (present_frame) {
+                    win.note_emulated_frames(ppu.frame_count());
+                    if (win.perf_overlay())
+                        win.set_perf_strict_counters(self_heal_distinct_misses(),
+                                                     self_heal_interpreted_insns());
+                    win.present(live_fb.data());
+                }
                 // Framedump (capture runs only) is attributed to present_us.
                 if (framedump_dir && frame >= framedump_start &&
                     framedump_written < framedump_max) {
