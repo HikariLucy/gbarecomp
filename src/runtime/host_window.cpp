@@ -13,11 +13,14 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "color_lut.h"
+#include "display_settings.h"
 #include "host_overlay.h"
+#include "host_perf.h"
 #include "presentation_layout.h"
 #include "touch_input.h"
 #if defined(GBARECOMP_RUNTIME_UI)
@@ -468,7 +471,119 @@ struct Backend {
     int          fps_presents = 0;
     // MC-WS-002: opt-in per-present timing/scanout ring (see above).
     PresentCadence cadence;
+
+    // ---- host presentation settings (display_settings.h) -------------------
+    // Fields not already represented above (fullscreen/scale/linear_filter/
+    // fps_readout stay the single source of truth for those).
+    AspectMode   aspect = AspectMode::Native;
+    ScaleMode    scale_mode = ScaleMode::Fit;
+    bool         vsync = false;
+    bool         crt_enabled = false;
+    int          scanline_strength = kDefaultScanlineStrength;
+    ColorProfile color_profile = ColorProfile::Off;
+    runtime::ColorSettings startup_color;   // model chosen at open (toml/env)
+    // The explicit-layout path drives the destination rect itself, so SDL's
+    // logical-size letterbox is disabled while it is active (and restored when
+    // it is not, keeping the default path identical to the historical one).
+    bool         explicit_layout = false;
+    // Scanline overlay: a 1 x dest_h ARGB texture of per-row black alpha,
+    // rebuilt only when the destination height, guest row count or strength
+    // change. A post-process stage in the sense of the pipeline note in
+    // present(): SDL_Renderer has no fragment shaders, so CRT Lite is an
+    // alpha-blended pass over the destination rectangle.
+    SDL_Texture* scanline_texture = nullptr;
+    int          scanline_tex_h = 0;
+    int          scanline_tex_rows = 0;
+    int          scanline_tex_strength = -1;
+    // Developer overlay + meters.
+    bool         perf_overlay = false;
+    bool         esc_closes_menu = false;   // ESC toggles the runtime menu closed
+    // Underruns while the guest is deliberately held (menu / pause hotkey) are
+    // expected starvation, not a fault: they are excluded from the counter.
+    bool         guest_held = false;
+    std::uint64_t underruns_at_hold = 0, underruns_excluded = 0;
+    // The emptied ring refills for a few hundred samples after a resume; that
+    // refill is excluded too (kResumeGraceMs) so the counter reflects faults.
+    std::uint64_t underruns_at_resume = 0, underruns_grace_seen = 0;
+    Uint32        resume_grace_until = 0;
+    bool         perf_hotkey = false;   // F10 toggles the overlay (opt-in)
+    RateMeter    present_meter{500};
+    RateMeter    emu_meter{500};
+    IntervalMeter frame_meter{500};
+    std::uint64_t present_count = 0;
+    std::uint64_t perf_dispatch_misses = 0;
+    std::uint64_t perf_interpreted_insns = 0;
+    int          display_refresh_hz = 0;
 };
+
+DisplaySettings backend_display_settings(const Backend* b) {
+    DisplaySettings s;
+    s.window_mode = b->fullscreen == 2 ? WindowMode::Exclusive
+                  : b->fullscreen == 1 ? WindowMode::Borderless
+                                       : WindowMode::Windowed;
+    s.window_scale = b->scale;
+    s.scale_mode = b->scale_mode;
+    s.aspect = b->aspect;
+    s.filtering = b->linear_filter ? FilterMode::Linear : FilterMode::Nearest;
+    s.vsync = b->vsync;
+    s.show_fps = b->fps_readout;
+    s.crt_enabled = b->crt_enabled;
+    s.scanline_strength = b->scanline_strength;
+    s.color_profile = b->color_profile;
+    sanitize_display_settings(&s);
+    return s;
+}
+
+void destroy_scanline_texture(Backend* b) {
+    if (!b) return;
+    if (b->scanline_texture) SDL_DestroyTexture(b->scanline_texture);
+    b->scanline_texture = nullptr;
+    b->scanline_tex_h = b->scanline_tex_rows = 0;
+    b->scanline_tex_strength = -1;
+}
+
+// Switch between SDL's logical-size letterbox (default, historical path) and
+// an explicitly computed destination rectangle (Stretch / Integer Fit / CRT).
+void sync_explicit_layout(Backend* b) {
+    const bool want = !b->expanded_view && !b->resize_driven_view &&
+                      backend_display_settings(b).needs_explicit_layout();
+    if (want == b->explicit_layout) return;
+    b->explicit_layout = want;
+    if (want) SDL_RenderSetLogicalSize(b->renderer, 0, 0);
+    else SDL_RenderSetLogicalSize(b->renderer, b->base_w, b->base_h);
+}
+
+// CRT Lite: subtle scanlines as an alpha-blended pass over the destination
+// rectangle. Needs at least 2 host rows per guest line (scanline_row_alpha
+// returns 0 below that), so a 1x window is left untouched.
+void draw_scanlines(Backend* b, const SDL_Rect& dst) {
+    const double peak = scanline_peak_alpha(b->scanline_strength);
+    if (peak <= 0.0 || dst.w <= 0 || dst.h < 2 * b->base_h) return;
+    if (!b->scanline_texture || b->scanline_tex_h != dst.h ||
+        b->scanline_tex_rows != b->base_h ||
+        b->scanline_tex_strength != b->scanline_strength) {
+        destroy_scanline_texture(b);
+        SDL_Texture* tex = SDL_CreateTexture(
+            b->renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, 1, dst.h);
+        if (!tex) return;
+        std::vector<Uint32> col(static_cast<std::size_t>(dst.h));
+        for (int y = 0; y < dst.h; ++y) {
+            const double a = scanline_row_alpha(y, dst.h, b->base_h, peak);
+            col[static_cast<std::size_t>(y)] =
+                static_cast<Uint32>(std::lround(a * 255.0)) << 24;   // black, alpha a
+        }
+        SDL_UpdateTexture(tex, nullptr, col.data(), static_cast<int>(sizeof(Uint32)));
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+        SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+#endif
+        b->scanline_texture = tex;
+        b->scanline_tex_h = dst.h;
+        b->scanline_tex_rows = b->base_h;
+        b->scanline_tex_strength = b->scanline_strength;
+    }
+    SDL_RenderCopy(b->renderer, b->scanline_texture, nullptr, &dst);
+}
 
 void destroy_sharp_texture(Backend* b) {
     if (!b) return;
@@ -1343,6 +1458,74 @@ bool runtime_menu_open(const Backend* b) {
 }
 #endif
 
+std::uint64_t raw_underrun_events(Backend* b) {
+    if (!b || !b->bridge_ready || !b->audio_mtx) return 0;
+    SDL_LockMutex(b->audio_mtx);
+    const std::uint64_t n = b->bridge.stats.underrun_events;
+    SDL_UnlockMutex(b->audio_mtx);
+    return n;
+}
+
+// Folds the post-resume refill into the exclusion once its grace window ends.
+// Called every presented frame while a grace window is open (a single compare
+// otherwise), so the exclusion is complete even if the overlay is off.
+void settle_underrun_grace(Backend* b) {
+    if (!b->resume_grace_until) return;
+    const std::uint64_t raw = raw_underrun_events(b);
+    if (raw >= b->underruns_at_resume) b->underruns_grace_seen = raw;
+    if (static_cast<Sint32>(SDL_GetTicks() - b->resume_grace_until) >= 0) {
+        b->underruns_excluded += b->underruns_grace_seen - b->underruns_at_resume;
+        b->resume_grace_until = 0;
+    }
+}
+
+// Underruns counted since start, minus those that happened while the guest was
+// deliberately held (an idle ring is expected to run dry then) and during the
+// short refill right after it resumes.
+std::uint64_t audio_underrun_events(Backend* b) {
+    settle_underrun_grace(b);
+    const std::uint64_t raw = raw_underrun_events(b);
+    std::uint64_t excluded = b->underruns_excluded;
+    if (b->guest_held && raw >= b->underruns_at_hold) excluded += raw - b->underruns_at_hold;
+    else if (b->resume_grace_until && raw >= b->underruns_at_resume)
+        excluded += raw - b->underruns_at_resume;
+    return raw >= excluded ? raw - excluded : 0;
+}
+
+// Developer performance overlay. EMU and PRESENT are different quantities (see
+// host_perf.h) and are labelled as such; the monitor refresh is shown only as
+// context, never as a game frame rate.
+void draw_perf_overlay(Backend* b, HostOverlay& ov) {
+    if (!b->perf_overlay || !ov.text_supported()) return;
+    char lines[5][96];
+    char refresh[24];
+    if (b->display_refresh_hz > 0) std::snprintf(refresh, sizeof(refresh), "%d Hz", b->display_refresh_hz);
+    else std::snprintf(refresh, sizeof(refresh), "n/a");
+    std::snprintf(lines[0], sizeof(lines[0]), "EMU     %6.2f fps (guest)",
+                  b->emu_meter.rate());
+    std::snprintf(lines[1], sizeof(lines[1]),
+                  "PRESENT %6.2f fps (host)  display %s",
+                  b->present_meter.rate(), refresh);
+    std::snprintf(lines[2], sizeof(lines[2]), "FRAME   %5.2f ms avg  %5.2f ms max",
+                  b->frame_meter.avg_ms(), b->frame_meter.max_ms());
+    std::snprintf(lines[3], sizeof(lines[3]), "AUDIO   underruns %llu (excl. paused)",
+                  static_cast<unsigned long long>(audio_underrun_events(b)));
+    std::snprintf(lines[4], sizeof(lines[4]), "STRICT  dispatch misses %llu  interpreted %llu",
+                  static_cast<unsigned long long>(b->perf_dispatch_misses),
+                  static_cast<unsigned long long>(b->perf_interpreted_insns));
+    const float size = std::max(13.0f, ov.drawable_height() / 42.0f);
+    const float pad = size * 0.5f;
+    const float line_h = size * 1.25f;
+    float width = 0.0f;
+    for (const auto& l : lines)
+        width = std::max(width, ov.text_width(l, size, OverlaySpace::Drawable));
+    ov.fill_rect(pad, pad, width + pad * 2.0f, line_h * 5 + pad * 2.0f, 4.0f,
+                 {0, 0, 0, 170}, OverlaySpace::Drawable);
+    for (int i = 0; i < 5; ++i)
+        ov.text(pad * 2.0f, pad * 2.0f + line_h * i, size, {235, 235, 235, 255},
+                lines[i], OverlayAlign::Left, OverlaySpace::Drawable);
+}
+
 // Host chrome drawn over the game image, in order: the game's host overlay,
 // the virtual pad and its toggle, the engine long-press cue, then (runtime UI
 // builds) the settings menu on top. Nothing here reads or writes guest state
@@ -1353,6 +1536,7 @@ void draw_host_chrome(Backend* b, HostOverlay& ov, bool menu_open) {
     draw_touch_pad(b, ov);
     draw_pad_toggle(b, ov);
     draw_engine_long_press(b, ov);
+    draw_perf_overlay(b, ov);
 }
 
 void render_host_layers(Backend* b) {
@@ -1363,7 +1547,7 @@ void render_host_layers(Backend* b) {
 #endif
     const bool chrome = !menu_open &&
         (b->host_overlay || (b->pad_visible && b->touch_controls) ||
-         pad_toggle_available(b) || touch_input_enabled(b));
+         pad_toggle_available(b) || touch_input_enabled(b) || b->perf_overlay);
     if (!chrome && !menu_open) return;
 
     // Native GBA presentation uses a 240x160 SDL logical size. Host chrome
@@ -1448,21 +1632,10 @@ PresentationLayout current_presentation_layout(Backend* b, int* out_w, int* out_
         // Mirror SDL_RenderSetLogicalSize's letterbox so touch maps exactly.
         if (SDL_GetRendererOutputSize(b->renderer, &drawable_w, &drawable_h) != 0)
             SDL_GetWindowSize(b->window, &drawable_w, &drawable_h);
-        if (drawable_w > 0 && drawable_h > 0) {
-            const float want = static_cast<float>(b->base_w) / b->base_h;
-            const float real = static_cast<float>(drawable_w) / drawable_h;
-            if (std::fabs(want - real) < 0.0001f) {
-                layout = {0, 0, drawable_w, drawable_h, 0};
-            } else if (want > real) {
-                const float scale = static_cast<float>(drawable_w) / b->base_w;
-                const int h = static_cast<int>(std::floor(b->base_h * scale));
-                layout = {0, (drawable_h - h) / 2, drawable_w, h, 0};
-            } else {
-                const float scale = static_cast<float>(drawable_h) / b->base_h;
-                const int w = static_cast<int>(std::floor(b->base_w * scale));
-                layout = {(drawable_w - w) / 2, 0, w, drawable_h, 0};
-            }
-        }
+        // Default settings reproduce that letterbox exactly (see
+        // compute_display_layout); Stretch / Integer Fit change it.
+        layout = compute_display_layout(drawable_w, drawable_h, b->base_w,
+                                        b->base_h, backend_display_settings(b));
     } else {
         // Preserve the established renderer-output path for fixed-width
         // extended views (including MMZ). Resize-driven view uses the same
@@ -1537,11 +1710,26 @@ void open_runtime_menu_from_touch(Backend* b) {
 
 #if defined(GBARECOMP_RUNTIME_UI)
 
-bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
+bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e,
+                      bool esc_closes_menu) {
     if (!ui) return false;
     if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
         !recomp_runtime_ui_is_open(ui)) {
         recomp_runtime_ui_open(ui);
+        return true;
+    }
+    // Opt-in: ESC is a plain open/close toggle. The shared menu's Back would
+    // only step out of a section, and a pointer resting over a row re-enters
+    // it on the next frame, so ESC could never close the menu with the mouse
+    // over it. A focused text field still gets ESC as "cancel edit".
+    if (esc_closes_menu && e.type == SDL_KEYDOWN && !e.key.repeat &&
+        e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
+        recomp_runtime_ui_is_open(ui)
+#if defined(RECOMP_RUNTIME_UI_HAS_TEXT)
+        && !recomp_runtime_ui_wants_text_input(ui)
+#endif
+        ) {
+        recomp_runtime_ui_close(ui);
         return true;
     }
     // A focused text field owns the keyboard. ImGui already saw this event
@@ -1805,6 +1993,7 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
                          b->resize_driven_view ? " (adaptive)" : "",
                          b->sharp_filter ? "sharp"
                          : b->linear_filter ? "linear" : "nearest");
+            b->vsync = (info.flags & SDL_RENDERER_PRESENTVSYNC) != 0;
             std::fflush(stderr);
         }
         log_display_mode(b->window, "open");
@@ -1929,7 +2118,8 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
         }
     }
 
-    b->color_lut = std::make_unique<runtime::ColorLut>(resolve_color_settings(screen));
+    b->startup_color = resolve_color_settings(screen);
+    b->color_lut = std::make_unique<runtime::ColorLut>(b->startup_color);
     if (!b->color_lut->is_passthrough())
         b->graded_fb.resize(static_cast<std::size_t>(base_w) * base_h * 3);
 
@@ -2114,6 +2304,7 @@ void HostWindow::close() {
     runtime_imgui_shutdown(b);
 #endif
     destroy_sharp_texture(b);
+    destroy_scanline_texture(b);
     if (b->texture)   SDL_DestroyTexture(b->texture);
     if (b->renderer)  SDL_DestroyRenderer(b->renderer);
     if (b->window)    SDL_DestroyWindow(b->window);
@@ -2221,6 +2412,9 @@ void HostWindow::present(const uint8_t* rgb888) {
         }
     }
 #endif
+#if !defined(__ANDROID__)
+    sync_explicit_layout(b);
+#endif
     int drawable_w = 0;
     int drawable_h = 0;
     const PresentationLayout layout =
@@ -2266,7 +2460,19 @@ void HostWindow::present(const uint8_t* rgb888) {
     SDL_RenderCopy(b->renderer, b->texture, nullptr, &destination);
 #else
     if (!b->expanded_view && !b->resize_driven_view) {
-        SDL_RenderCopy(b->renderer, b->texture, nullptr, nullptr);
+        if (b->explicit_layout) {
+            // Post-process pipeline (SDL_Renderer has no fragment shaders):
+            //   GBA framebuffer texture -> destination rect -> [CRT Lite pass]
+            // Pass-through when CRT is off.
+            if (layout.width > 0 && layout.height > 0) {
+                const SDL_Rect destination = {
+                    layout.x, layout.y, layout.width, layout.height};
+                SDL_RenderCopy(b->renderer, b->texture, nullptr, &destination);
+                if (b->crt_enabled) draw_scanlines(b, destination);
+            }
+        } else {
+            SDL_RenderCopy(b->renderer, b->texture, nullptr, nullptr);
+        }
     } else {
         if (layout.width > 0 && layout.height > 0) {
             const SDL_Rect destination = {
@@ -2312,20 +2518,26 @@ void HostWindow::present(const uint8_t* rgb888) {
         SDL_RenderPresent(b->renderer);
     }
 
-    // FPS readout (DisplayPerf hotkey): presents/sec, refreshed twice a
-    // second in the title bar; the base title is restored when toggled off.
-    if (b->fps_readout) {
-        ++b->fps_presents;
+    // FPS readout (DisplayPerf hotkey) and the F10 overlay share these meters.
+    // They only run while one of the two is enabled, so the default path pays
+    // nothing. EMU (guest frames) and PRESENT (host presents) are reported
+    // separately; neither is the monitor refresh.
+    if (b->fps_readout || b->perf_overlay) {
         const Uint32 now = SDL_GetTicks();
-        if (b->fps_window_start == 0) b->fps_window_start = now;
-        const Uint32 span = now - b->fps_window_start;
-        if (span >= 500) {
-            char buf[192];
-            std::snprintf(buf, sizeof(buf), "%s — %.1f fps", b->title.c_str(),
-                          b->fps_presents * 1000.0 / span);
-            SDL_SetWindowTitle(b->window, buf);
-            b->fps_window_start = now;
-            b->fps_presents = 0;
+        ++b->present_count;
+        b->present_meter.sample(b->present_count, now);
+        b->frame_meter.tick(SDL_GetPerformanceCounter() * 1000000ull /
+                            SDL_GetPerformanceFrequency());
+        if (b->fps_readout) {
+            if (b->fps_window_start == 0) b->fps_window_start = now;
+            if (now - b->fps_window_start >= 500) {
+                char buf[192];
+                std::snprintf(buf, sizeof(buf), "%s — EMU %.1f | PRESENT %.1f fps",
+                              b->title.c_str(), b->emu_meter.rate(),
+                              b->present_meter.rate());
+                SDL_SetWindowTitle(b->window, buf);
+                b->fps_window_start = now;
+            }
         }
     }
 }
@@ -2694,6 +2906,226 @@ bool HostWindow::fps_readout() const {
     return static_cast<const Backend*>(impl_)->fps_readout;
 }
 
+// ---- host presentation settings ----------------------------------------------
+
+namespace {
+
+// Replace one INI section of <dir>/config.ini with `body` (header included),
+// preserving every other section — the same scheme save_touch_config uses.
+void rewrite_ini_section(const std::string& dir, const char* section,
+                         const std::string& body) {
+    if (dir.empty()) return;
+    const std::string path = dir + "/config.ini";
+    std::string existing;
+    {
+        std::ifstream in(path, std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        existing = ss.str();
+    }
+    std::ofstream out(path, std::ios::trunc | std::ios::binary);
+    if (out) out << ini_replace_section(existing, section, body);
+}
+
+int query_display_refresh_hz(SDL_Window* window) {
+    SDL_DisplayMode mode{};
+    const int idx = SDL_GetWindowDisplayIndex(window);
+    if (idx >= 0 && SDL_GetCurrentDisplayMode(idx, &mode) == 0) return mode.refresh_rate;
+    return 0;
+}
+
+runtime::ColorSettings color_settings_for(const Backend* b, ColorProfile profile) {
+    runtime::ColorSettings cs = b->startup_color;
+    if (profile == ColorProfile::GbaLike) cs.screen = runtime::ScreenKind::Classic;
+    return cs;
+}
+
+}  // namespace
+
+DisplaySettings HostWindow::display_settings() const {
+    if (!open_ || !impl_) return {};
+    return backend_display_settings(static_cast<const Backend*>(impl_));
+}
+
+void HostWindow::set_display_settings(const DisplaySettings& requested) {
+    if (!open_ || !impl_) return;
+    DisplaySettings s = requested;
+    sanitize_display_settings(&s);
+    auto* b = static_cast<Backend*>(impl_);
+    // Size first (meaningless while fullscreen; the stored scale is restored
+    // by the next adjust), then mode, then the pure-presentation fields.
+    if (!b->fullscreen) adjust_scale(s.window_scale - b->scale);
+    else b->scale = s.window_scale;
+    set_fullscreen(s.window_mode == WindowMode::Exclusive ? 2
+                 : s.window_mode == WindowMode::Borderless ? 1 : 0);
+    set_linear_filter(s.filtering == FilterMode::Linear);
+    set_aspect_mode(s.aspect);
+    set_scale_mode(s.scale_mode);
+    set_vsync(s.vsync);
+    set_crt_enabled(s.crt_enabled);
+    set_scanline_strength(s.scanline_strength);
+    set_color_profile(s.color_profile);
+    set_fps_readout(s.show_fps);
+}
+
+void HostWindow::set_aspect_mode(AspectMode mode) {
+    if (!open_ || !impl_) return;
+    static_cast<Backend*>(impl_)->aspect = mode;
+}
+
+void HostWindow::set_scale_mode(ScaleMode mode) {
+    if (!open_ || !impl_) return;
+    static_cast<Backend*>(impl_)->scale_mode = mode;
+}
+
+void HostWindow::set_vsync(bool on) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    if (SDL_RenderSetVSync(b->renderer, on ? 1 : 0) == 0) {
+        b->vsync = on;
+        return;
+    }
+    std::fprintf(stderr, "host_window: vsync %s unavailable on this renderer: %s\n",
+                 on ? "enable" : "disable", SDL_GetError());
+    SDL_RendererInfo info{};
+    b->vsync = SDL_GetRendererInfo(b->renderer, &info) == 0 &&
+               (info.flags & SDL_RENDERER_PRESENTVSYNC) != 0;
+#else
+    (void)on;
+    b->vsync = false;
+#endif
+}
+
+bool HostWindow::vsync() const {
+    return open_ && impl_ && static_cast<const Backend*>(impl_)->vsync;
+}
+
+void HostWindow::set_crt_enabled(bool on) {
+    if (!open_ || !impl_) return;
+    static_cast<Backend*>(impl_)->crt_enabled = on;
+}
+
+void HostWindow::set_scanline_strength(int percent) {
+    if (!open_ || !impl_) return;
+    static_cast<Backend*>(impl_)->scanline_strength =
+        std::clamp(percent, kMinScanlineStrength, kMaxScanlineStrength);
+}
+
+void HostWindow::set_color_profile(ColorProfile profile) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    if (b->color_profile == profile && b->color_lut) return;
+    b->color_profile = profile;
+    b->color_lut = std::make_unique<runtime::ColorLut>(color_settings_for(b, profile));
+    if (!b->color_lut->is_passthrough())
+        b->graded_fb.resize(static_cast<std::size_t>(b->base_w) * b->base_h * 3u);
+    else
+        std::vector<uint8_t>().swap(b->graded_fb);
+}
+
+bool HostWindow::load_display_settings() {
+    if (!open_ || !impl_) return false;
+    auto* b = static_cast<Backend*>(impl_);
+    if (b->touch_config_dir.empty()) return false;
+    std::string text;
+    {
+        std::ifstream in(b->touch_config_dir + "/config.ini", std::ios::binary);
+        if (!in) return false;
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        text = ss.str();
+    }
+    DisplaySettings s = backend_display_settings(b);
+    int rejected = 0;
+    const bool any = display_settings_parse_ini(&s, text, &rejected);
+    if (rejected)
+        std::fprintf(stderr, "host_window: ignored %d invalid [Display] line(s)\n", rejected);
+    if (!any) return false;
+    set_display_settings(s);
+    return true;
+}
+
+void HostWindow::save_display_settings() const {
+    if (!open_ || !impl_) return;
+    const auto* b = static_cast<const Backend*>(impl_);
+    rewrite_ini_section(b->touch_config_dir,
+                        "Display", display_settings_to_ini(backend_display_settings(b)));
+}
+
+void HostWindow::set_perf_overlay(bool on) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    if (b->perf_overlay == on) return;
+    b->perf_overlay = on;
+    b->present_meter.reset();
+    b->emu_meter.reset();
+    b->present_count = 0;
+    if (on) b->display_refresh_hz = query_display_refresh_hz(b->window);
+}
+
+void HostWindow::set_esc_closes_menu(bool enabled) {
+    if (!open_ || !impl_) return;
+    static_cast<Backend*>(impl_)->esc_closes_menu = enabled;
+}
+
+void HostWindow::set_guest_held(bool held) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    if (held == b->guest_held) return;
+    const std::uint64_t raw = raw_underrun_events(b);
+    if (held) {
+        if (b->resume_grace_until) {   // held again before the refill window ended
+            b->underruns_excluded += raw - b->underruns_at_resume;
+            b->resume_grace_until = 0;
+        }
+        b->underruns_at_hold = raw;
+    } else {
+        if (raw >= b->underruns_at_hold) b->underruns_excluded += raw - b->underruns_at_hold;
+        constexpr Uint32 kResumeGraceMs = 400;
+        b->underruns_at_resume = b->underruns_grace_seen = raw;
+        b->resume_grace_until = SDL_GetTicks() + kResumeGraceMs;
+    }
+    b->guest_held = held;
+}
+
+void HostWindow::set_perf_overlay_hotkey(bool enabled) {
+    if (!open_ || !impl_) return;
+    static_cast<Backend*>(impl_)->perf_hotkey = enabled;
+}
+
+bool HostWindow::perf_overlay() const {
+    return open_ && impl_ && static_cast<const Backend*>(impl_)->perf_overlay;
+}
+
+void HostWindow::note_emulated_frames(std::uint64_t total_frames) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    settle_underrun_grace(b);
+    if (b->fps_readout || b->perf_overlay) b->emu_meter.sample(total_frames, SDL_GetTicks());
+}
+
+void HostWindow::set_perf_strict_counters(std::uint64_t dispatch_misses,
+                                          std::uint64_t interpreted_insns) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->perf_dispatch_misses = dispatch_misses;
+    b->perf_interpreted_insns = interpreted_insns;
+}
+
+HostWindow::PerfSnapshot HostWindow::perf_snapshot() const {
+    PerfSnapshot p;
+    if (!open_ || !impl_) return p;
+    auto* b = static_cast<Backend*>(impl_);
+    p.emu_fps = b->emu_meter.rate();
+    p.present_fps = b->present_meter.rate();
+    p.frame_ms_avg = b->frame_meter.avg_ms();
+    p.frame_ms_max = b->frame_meter.max_ms();
+    p.audio_underruns = audio_underrun_events(b);
+    p.display_refresh_hz = b->display_refresh_hz;
+    return p;
+}
+
 void HostWindow::service_events() {
     if (!open_ || !impl_) return;
     SDL_PumpEvents();
@@ -2737,7 +3169,7 @@ HostWindow::Events HostWindow::pump() {
             ImGui::SetCurrentContext(b->runtime_imgui_context);
             ImGui_ImplSDL2_ProcessEvent(&e);
         }
-        if (runtime_ui_event(b->runtime_ui, e)) continue;
+        if (runtime_ui_event(b->runtime_ui, e, b->esc_closes_menu)) continue;
 #endif
         if (e.type == SDL_QUIT) {
             ev.quit = true;
@@ -2888,6 +3320,10 @@ HostWindow::Events HostWindow::pump() {
             Uint16 mods = e.key.keysym.mod;
             if (sym == SDLK_ESCAPE) {
                 ev.quit = true;
+            } else if (sym == SDLK_F10 && b->perf_hotkey) {
+                // F1..F9 are save-state slots, so the developer overlay lives
+                // on F10 (opt-in via set_perf_overlay_hotkey).
+                set_perf_overlay(!b->perf_overlay);
             } else if (sym >= SDLK_F1 && sym <= SDLK_F9) {
                 int slot = static_cast<int>(sym - SDLK_F1) + 1;
                 if (mods & KMOD_SHIFT) ev.save_slot = slot;
@@ -3128,6 +3564,25 @@ void host_haptic_pulse(int, float) {}
 void host_request_settings_menu() {}
 void HostWindow::set_fps_readout(bool /*on*/) {}
 bool HostWindow::fps_readout() const { return false; }
+DisplaySettings HostWindow::display_settings() const { return {}; }
+void HostWindow::set_display_settings(const DisplaySettings&) {}
+void HostWindow::set_aspect_mode(AspectMode) {}
+void HostWindow::set_scale_mode(ScaleMode) {}
+void HostWindow::set_vsync(bool) {}
+bool HostWindow::vsync() const { return false; }
+void HostWindow::set_crt_enabled(bool) {}
+void HostWindow::set_scanline_strength(int) {}
+void HostWindow::set_color_profile(ColorProfile) {}
+bool HostWindow::load_display_settings() { return false; }
+void HostWindow::save_display_settings() const {}
+void HostWindow::set_perf_overlay(bool) {}
+void HostWindow::set_perf_overlay_hotkey(bool) {}
+void HostWindow::set_guest_held(bool) {}
+void HostWindow::set_esc_closes_menu(bool) {}
+bool HostWindow::perf_overlay() const { return false; }
+void HostWindow::note_emulated_frames(std::uint64_t) {}
+void HostWindow::set_perf_strict_counters(std::uint64_t, std::uint64_t) {}
+HostWindow::PerfSnapshot HostWindow::perf_snapshot() const { return {}; }
 bool HostWindow::assist_tools_enabled() const { return true; }
 int HostWindow::fast_forward_multiplier() const { return 4; }
 

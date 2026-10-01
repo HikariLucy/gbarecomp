@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "display_settings.h"
+
 struct RecompRuntimeUi;
 
 namespace gbarecomp {
@@ -133,6 +135,59 @@ public:
 
     void set_fps_readout(bool on);      // presents-per-second in the title bar
     bool fps_readout() const;
+
+    // ---- host presentation settings (display_settings.h) -------------------
+    // Presentation only: nothing here reaches the guest. The current settings
+    // are assembled from the live window state, so the legacy setters above
+    // (set_fullscreen, adjust_scale, set_linear_filter, set_fps_readout) and
+    // this API always agree.
+    DisplaySettings display_settings() const;
+    // Applies every field live (window mode/size, filter, vsync, CRT, colour).
+    // Values are sanitized first; unsupported ones fall back safely.
+    void set_display_settings(const DisplaySettings& settings);
+    // Granular live setters used by the in-game menu.
+    void set_aspect_mode(AspectMode mode);
+    void set_scale_mode(ScaleMode mode);
+    void set_vsync(bool on);
+    bool vsync() const;
+    void set_crt_enabled(bool on);
+    void set_scanline_strength(int percent);
+    void set_color_profile(ColorProfile profile);
+    // Persistence: [Display] in <dir>/config.ini (the directory given to
+    // set_touch_config_dir). load returns false when no valid section exists;
+    // invalid values keep the current setting. Other sections are preserved.
+    bool load_display_settings();
+    void save_display_settings() const;
+
+    // Developer performance overlay (EMU/PRESENT rates, frame time, audio
+    // underruns, strict-static counters). Off by default.
+    void set_perf_overlay(bool on);
+    bool perf_overlay() const;
+    // Enable the F10 hotkey for the overlay (F1-F9 are save-state slots).
+    void set_perf_overlay_hotkey(bool enabled);
+    // The runtime reports when it deliberately holds the guest (runtime menu or
+    // pause hotkey) so audio-ring starvation then is not counted as a fault.
+    void set_guest_held(bool held);
+    // ESC always closes the open runtime menu (instead of stepping out of a
+    // section), so ESC is a symmetric open/close toggle even with the mouse
+    // resting over a row.
+    void set_esc_closes_menu(bool enabled);
+    // Call once per emulated frame boundary with the guest's cumulative frame
+    // count so EMU and PRESENT rates are measured separately.
+    void note_emulated_frames(std::uint64_t total_frames);
+    // Strict-static counters shown on the overlay (distinct dispatch misses and
+    // interpreted instructions). Informational only.
+    void set_perf_strict_counters(std::uint64_t dispatch_misses,
+                                  std::uint64_t interpreted_insns);
+    struct PerfSnapshot {
+        double emu_fps = 0.0;
+        double present_fps = 0.0;
+        double frame_ms_avg = 0.0;
+        double frame_ms_max = 0.0;
+        std::uint64_t audio_underruns = 0;
+        int display_refresh_hz = 0;   // monitor refresh of the window's display
+    };
+    PerfSnapshot perf_snapshot() const;
     bool assist_tools_enabled() const;
     int  fast_forward_multiplier() const;
 
