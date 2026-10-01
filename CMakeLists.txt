@@ -819,6 +819,36 @@ if(Python3_Interpreter_FOUND AND UNIX)
 endif()
 
 if(Python3_Interpreter_FOUND AND UNIX)
+    set(PRIVATE_LOOKUP_FIXTURE_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/private_lookup_fixture")
+    set(PRIVATE_LOOKUP_GENERATED_DIR "${PRIVATE_LOOKUP_FIXTURE_DIR}/generated")
+    set(PRIVATE_LOOKUP_COUNT 4096)
+    add_custom_command(
+        OUTPUT
+            "${PRIVATE_LOOKUP_GENERATED_DIR}/recompiled.h"
+            "${PRIVATE_LOOKUP_GENERATED_DIR}/recompiled_000.cpp"
+            "${PRIVATE_LOOKUP_GENERATED_DIR}/recompiled_001.cpp"
+            "${PRIVATE_LOOKUP_GENERATED_DIR}/dispatch_table.cpp"
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/private_lookup/generate_fixture.py"
+            "$<TARGET_FILE:gba_recompile>"
+            "${PRIVATE_LOOKUP_FIXTURE_DIR}" ${PRIVATE_LOOKUP_COUNT}
+        DEPENDS gba_recompile
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/recompile/private_lookup/generate_fixture.py"
+        VERBATIM)
+    add_executable(private_lookup_runtime_tests
+        tests/recompile/private_lookup/runtime_test.cpp
+        "${PRIVATE_LOOKUP_GENERATED_DIR}/recompiled_000.cpp"
+        "${PRIVATE_LOOKUP_GENERATED_DIR}/recompiled_001.cpp"
+        "${PRIVATE_LOOKUP_GENERATED_DIR}/dispatch_table.cpp")
+    target_include_directories(private_lookup_runtime_tests PRIVATE
+        "${PRIVATE_LOOKUP_GENERATED_DIR}" src/armv4t src/gba src/runtime)
+    target_link_gbarecomp_runtime_stack(private_lookup_runtime_tests)
+    add_test(NAME private_lookup_runtime_tests
+        COMMAND private_lookup_runtime_tests ${PRIVATE_LOOKUP_COUNT})
+endif()
+
+if(Python3_Interpreter_FOUND AND UNIX)
     set(ISCFG_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/image_scoped_cfg_fixture")
     set(ISCFG_GENERATED_DIR "${ISCFG_FIXTURE_DIR}/generated")
     add_custom_command(

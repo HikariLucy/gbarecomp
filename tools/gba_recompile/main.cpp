@@ -617,6 +617,34 @@ void write_dispatch_table(const std::string& dir,
         std::fprintf(f,
             "};\nextern \"C\" const unsigned kPrivateDispatchTableLen "
             "= %zu;\n", private_entries.size());
+        // Lookup index: (image, mode, pc) keys sorted ascending, with the
+        // original table index as tie-break so a binary search reproduces the
+        // first-match semantics of a linear scan over kPrivateDispatchTable.
+        {
+            std::vector<std::pair<uint64_t, std::size_t>> index;
+            index.reserve(private_entries.size());
+            for (std::size_t i = 0; i < private_entries.size(); ++i) {
+                const auto& e = private_entries[i];
+                index.emplace_back(
+                    (static_cast<uint64_t>(e.domain) << 33) |
+                    (static_cast<uint64_t>(e.thumb ? 1u : 0u) << 32) | e.addr,
+                    i);
+            }
+            std::sort(index.begin(), index.end());
+            std::fprintf(f,
+                "// Sorted (image<<33 | thumb<<32 | pc) keys + table slots: "
+                "O(log n) private lookup.\n"
+                "static const uint64_t kPrivateIndexKey[] = {\n");
+            for (const auto& kv : index)
+                std::fprintf(f, "    0x%llXull,\n",
+                             static_cast<unsigned long long>(kv.first));
+            if (index.empty()) std::fprintf(f, "    0ull,\n");
+            std::fprintf(f, "};\nstatic const uint32_t kPrivateIndexSlot[] = {\n");
+            for (const auto& kv : index)
+                std::fprintf(f, "    %zuu,\n", kv.second);
+            if (index.empty()) std::fprintf(f, "    0u,\n");
+            std::fprintf(f, "};\n");
+        }
         std::fprintf(f, "static const char* const kPrivateImageIds[] = {\n");
         for (std::size_t d = 0; d < domain_count; ++d) {
             const std::string id = d < image_ids.size() ? image_ids[d]
@@ -644,15 +672,20 @@ void write_dispatch_table(const std::string& dir,
             "uint32_t pc, int thumb) {\n"
             "    if (image < 0 || static_cast<unsigned>(image) >= kPrivateImageCount) "
             "return 0;\n"
-            "    for (unsigned i = 0; i < kPrivateDispatchTableLen; ++i) {\n"
-            "        const auto& e = kPrivateDispatchTable[i];\n"
-            "        if (e.image != static_cast<unsigned>(image) ||\n"
-            "            e.addr != (pc & ~1u) || e.thumb != (thumb != 0)) continue;\n"
-            "        g_runtime_resume_pc = e.resume ? e.addr : 0u;\n"
-            "        e.fn();\n"
-            "        return 1;\n"
+            "    const uint64_t key = (static_cast<uint64_t>(image) << 33) |\n"
+            "                         (static_cast<uint64_t>(thumb != 0) << 32) |\n"
+            "                         (pc & ~1u);\n"
+            "    unsigned lo = 0, hi = kPrivateDispatchTableLen;\n"
+            "    while (lo < hi) {  // first index with key >= wanted\n"
+            "        const unsigned mid = lo + ((hi - lo) >> 1);\n"
+            "        if (kPrivateIndexKey[mid] < key) lo = mid + 1; else hi = mid;\n"
             "    }\n"
-            "    return 0;\n"
+            "    if (lo >= kPrivateDispatchTableLen || kPrivateIndexKey[lo] != key)\n"
+            "        return 0;\n"
+            "    const auto& e = kPrivateDispatchTable[kPrivateIndexSlot[lo]];\n"
+            "    g_runtime_resume_pc = e.resume ? e.addr : 0u;\n"
+            "    e.fn();\n"
+            "    return 1;\n"
             "}\n"
             "// Unscoped API: private entries of the primary world only (image 0).\n"
             "// It never selects an overlay image body.\n"
