@@ -2271,12 +2271,13 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
             std::fprintf(stderr,
                 "[gba-audio-probe] pushes=%llu audio=%.1fs bridge_underrun=%llu(%.2f/s) "
                 "stretch=%.0fms(ev=%llu) overflow_drops=%llu fill_ms=%.1f corr=%+.3f%% "
-                "gt_compile=%.1fms(+%.1fms)\n",
+                "gt_compile=%.1fms(+%.1fms) net_underrun=%llu\n",
                 s_pushes, secs, (unsigned long long)st.underrun_events,
                 secs > 0 ? st.underrun_events / secs : 0.0,
                 stretch_ms, (unsigned long long)st.stretch_events,
                 (unsigned long long)st.overflow_drops, rab_fill_ms(&b->bridge),
-                st.last_correction * 100.0, gt_ms, gt_dms);
+                st.last_correction * 100.0, gt_ms, gt_dms,
+                (unsigned long long)audio_underrun_events(b));
             std::fflush(stderr);
         }
     }
