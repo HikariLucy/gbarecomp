@@ -26,4 +26,15 @@ std::vector<DispatchTableEntrySpec> build_dispatch_table_entries(
 std::vector<DispatchTableEntrySpec> build_private_dispatch_table_entries(
     const std::vector<Function>& functions);
 
+// Private-entry lookup index. The generated runtime binary-searches rows sorted
+// by key (image<<33 | thumb<<32 | pc); equal keys keep table order so the
+// search reproduces the first-match behaviour of a linear scan of the table.
+struct PrivateIndexRow {
+    std::uint64_t key;
+    std::size_t slot;  // row of the private dispatch table
+};
+std::uint64_t private_lookup_key(std::uint16_t image, bool thumb, std::uint32_t pc);
+std::vector<PrivateIndexRow> build_private_lookup_index(
+    const std::vector<DispatchTableEntrySpec>& private_entries);
+
 }  // namespace gbarecomp

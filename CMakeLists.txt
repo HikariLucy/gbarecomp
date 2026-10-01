@@ -979,6 +979,11 @@ add_executable(executable_image_tests tests/recompile/executable_image_test.cpp)
 target_link_libraries(executable_image_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME executable_image_tests COMMAND executable_image_tests)
 
+add_executable(private_lookup_index_tests tests/recompile/private_lookup_index_test.cpp)
+target_link_libraries(private_lookup_index_tests PRIVATE gbarecomp_recompile_core)
+target_include_directories(private_lookup_index_tests PRIVATE src/recompile)
+add_test(NAME private_lookup_index_tests COMMAND private_lookup_index_tests)
+
 add_executable(link_branch_tests tests/recompile/link_branch_test.cpp)
 target_link_libraries(link_branch_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME link_branch_tests COMMAND link_branch_tests)

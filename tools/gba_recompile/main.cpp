@@ -621,27 +621,19 @@ void write_dispatch_table(const std::string& dir,
         // original table index as tie-break so a binary search reproduces the
         // first-match semantics of a linear scan over kPrivateDispatchTable.
         {
-            std::vector<std::pair<uint64_t, std::size_t>> index;
-            index.reserve(private_entries.size());
-            for (std::size_t i = 0; i < private_entries.size(); ++i) {
-                const auto& e = private_entries[i];
-                index.emplace_back(
-                    (static_cast<uint64_t>(e.domain) << 33) |
-                    (static_cast<uint64_t>(e.thumb ? 1u : 0u) << 32) | e.addr,
-                    i);
-            }
-            std::sort(index.begin(), index.end());
+            const auto index =
+                gbarecomp::build_private_lookup_index(private_entries);
             std::fprintf(f,
                 "// Sorted (image<<33 | thumb<<32 | pc) keys + table slots: "
                 "O(log n) private lookup.\n"
                 "static const uint64_t kPrivateIndexKey[] = {\n");
             for (const auto& kv : index)
                 std::fprintf(f, "    0x%llXull,\n",
-                             static_cast<unsigned long long>(kv.first));
+                             static_cast<unsigned long long>(kv.key));
             if (index.empty()) std::fprintf(f, "    0ull,\n");
             std::fprintf(f, "};\nstatic const uint32_t kPrivateIndexSlot[] = {\n");
             for (const auto& kv : index)
-                std::fprintf(f, "    %zuu,\n", kv.second);
+                std::fprintf(f, "    %zuu,\n", kv.slot);
             if (index.empty()) std::fprintf(f, "    0u,\n");
             std::fprintf(f, "};\n");
         }
