@@ -1082,6 +1082,12 @@ add_executable(presentation_layout_tests tests/presentation_layout/test_main.cpp
 target_include_directories(presentation_layout_tests PRIVATE src/runtime)
 add_test(NAME presentation_layout_tests COMMAND presentation_layout_tests)
 
+# Presentation pacing (fake clock), controller navigation, CRT presets and the
+# [Display] settings model. Header-only logic: no SDL, no window.
+add_executable(presentation_pacing_tests tests/presentation_pacing/test_main.cpp)
+target_include_directories(presentation_pacing_tests PRIVATE src/runtime)
+add_test(NAME presentation_pacing_tests COMMAND presentation_pacing_tests)
+
 # Touch input: gesture recognizer, hub rings/scripts, key synthesis, JSON.
 add_gbarecomp_runtime_stack_test(touch_input_tests tests/touch_input/test_main.cpp)
 add_gbarecomp_runtime_stack_test(multiplayer_session_tests tests/link/session_test.cpp)
