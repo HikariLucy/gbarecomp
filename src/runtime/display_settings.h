@@ -20,6 +20,7 @@
 #include <string_view>
 
 #include "presentation_layout.h"
+#include "presentation_pacing.h"
 
 namespace gbarecomp {
 
@@ -32,8 +33,11 @@ enum class ScaleMode : std::uint8_t { Fit = 0, IntegerFit = 1 };
 // drawable, distorting the image. Native is the default and Stretch is opt-in.
 enum class AspectMode : std::uint8_t { Native = 0, Stretch = 1 };
 enum class FilterMode : std::uint8_t { Nearest = 0, Linear = 1 };
-// Only Lite exists. The enum is the extension point for future presets.
-enum class CrtPreset : std::uint8_t { Lite = 0 };
+// CRT presets. Each one is a scanline strength plus a profile shape (see
+// crt_preset_params); no curvature, no phosphor mask. Custom keeps whatever
+// strength the user dialled in with the slider. Lite stays value 0 so older
+// config files keep their meaning.
+enum class CrtPreset : std::uint8_t { Lite = 0, Soft = 1, Strong = 2, Custom = 3 };
 // Present-time colour transform. GbaLike applies the community-canonical
 // gamma-4.0 GBA colour model (color_lut.h, ScreenKind::Classic). It is an
 // approximation of the handheld's look, NOT an exact emulation of any specific
@@ -46,6 +50,42 @@ constexpr int kDefaultWindowScale = 3;   // matches the runtime's historical --s
 constexpr int kMinScanlineStrength = 0;
 constexpr int kMaxScanlineStrength = 100;
 constexpr int kDefaultScanlineStrength = 40;
+// Shape of the scanline profile: 1.0 is the plain cosine bump, <1 widens the
+// dark band (softer), >1 narrows it (crisper lines).
+struct CrtParams {
+    int strength;     // scanline strength, 0..100 (%)
+    double shape;
+};
+// Parameters for a preset. Custom returns shape 1.0 and the caller's strength.
+inline CrtParams crt_preset_params(CrtPreset p, int custom_strength) {
+    switch (p) {
+        case CrtPreset::Lite:   return {40, 1.0};     // the ENHANCEMENTS-1 look
+        case CrtPreset::Soft:   return {22, 0.75};
+        case CrtPreset::Strong: return {70, 1.5};
+        case CrtPreset::Custom: break;
+    }
+    return {custom_strength, 1.0};
+}
+inline const char* crt_preset_name(CrtPreset p) {
+    return p == CrtPreset::Soft ? "soft" : p == CrtPreset::Strong ? "strong"
+         : p == CrtPreset::Custom ? "custom" : "lite";
+}
+inline bool parse_crt_preset(std::string_view v, CrtPreset* out) {
+    if (v == "lite") *out = CrtPreset::Lite;
+    else if (v == "soft") *out = CrtPreset::Soft;
+    else if (v == "strong") *out = CrtPreset::Strong;
+    else if (v == "custom") *out = CrtPreset::Custom;
+    else return false;
+    return true;
+}
+
+// Window mode toggled by Alt+Enter: Windowed <-> Borderless fullscreen.
+// Exclusive fullscreen is deliberately not part of the toggle; leaving it goes
+// to Windowed.
+inline WindowMode toggle_window_mode(WindowMode m) {
+    return m == WindowMode::Windowed ? WindowMode::Borderless : WindowMode::Windowed;
+}
+
 // A 100% slider is capped at this peak darkening so no setting can make the
 // image unreadable (the darkest scanline row is never darker than 50%).
 constexpr double kScanlinePeakAlpha = 0.5;
@@ -61,6 +101,10 @@ struct DisplaySettings {
     // displays (see host_window.cpp), so synchronized swap is opt-in.
     bool vsync = false;
     bool show_fps = false;
+    // Native: one present per guest frame. MonitorRefresh: the host re-presents
+    // the current frame at the monitor's rate between guest frames (see
+    // presentation_pacing.h). The guest stays at 59.7275 Hz either way.
+    PresentationMode presentation = PresentationMode::Native;
 
     bool crt_enabled = false;
     CrtPreset crt_preset = CrtPreset::Lite;
@@ -71,7 +115,8 @@ struct DisplaySettings {
         return window_mode == o.window_mode && window_scale == o.window_scale &&
                scale_mode == o.scale_mode && aspect == o.aspect &&
                filtering == o.filtering && vsync == o.vsync &&
-               show_fps == o.show_fps && crt_enabled == o.crt_enabled &&
+               show_fps == o.show_fps && presentation == o.presentation &&
+               crt_enabled == o.crt_enabled &&
                crt_preset == o.crt_preset &&
                scanline_strength == o.scanline_strength &&
                color_profile == o.color_profile;
@@ -94,6 +139,13 @@ inline void sanitize_display_settings(DisplaySettings* s) {
     s->window_scale = std::clamp(s->window_scale, kMinWindowScale, kMaxWindowScale);
     s->scanline_strength = std::clamp(s->scanline_strength, kMinScanlineStrength,
                                       kMaxScanlineStrength);
+    // A named preset whose strength no longer matches it (an older config with a
+    // hand-tuned slider, or a hand-edited file) is a Custom look: keep the
+    // strength the user actually had and say so, rather than silently showing
+    // "Lite" with another strength.
+    if (s->crt_preset != CrtPreset::Custom &&
+        s->scanline_strength != crt_preset_params(s->crt_preset, 0).strength)
+        s->crt_preset = CrtPreset::Custom;
 }
 
 // Peak scanline darkening (0..kScanlinePeakAlpha) for a 0..100 slider value.
@@ -110,12 +162,13 @@ inline double scanline_peak_alpha(int strength_percent) {
 // pattern follows the guest raster at any scale, including non-integer fits.
 // Below 2 host rows per guest line there is no room for a pattern: returns 0.
 inline double scanline_row_alpha(int dest_row, int dest_height, int logical_rows,
-                                 double peak_alpha) {
+                                 double peak_alpha, double shape = 1.0) {
     if (dest_height <= 0 || logical_rows <= 0 || peak_alpha <= 0.0) return 0.0;
     if (dest_height < 2 * logical_rows) return 0.0;
     const double t = std::fmod((dest_row + 0.5) * logical_rows / dest_height, 1.0);
     constexpr double kTwoPi = 6.283185307179586;
-    return peak_alpha * 0.5 * (1.0 + std::cos(kTwoPi * (t - 0.75)));
+    const double bump = 0.5 * (1.0 + std::cos(kTwoPi * (t - 0.75)));   // 0..1
+    return peak_alpha * (shape == 1.0 ? bump : std::pow(bump, shape));
 }
 
 // Destination rectangle for the logical frame inside the drawable, honouring
@@ -214,8 +267,9 @@ inline bool display_settings_set(DisplaySettings* s, std::string_view key,
         if (!parse_bool(v, &b)) return false;
         s->crt_enabled = b;
     } else if (key == "crt_preset") {
-        if (v == "lite") s->crt_preset = CrtPreset::Lite;
-        else return false;
+        if (!parse_crt_preset(v, &s->crt_preset)) return false;
+    } else if (key == "presentation") {
+        if (!parse_presentation_mode(v, &s->presentation)) return false;
     } else if (key == "scanline_strength") {
         if (!parse_int(v, &n) || n < kMinScanlineStrength || n > kMaxScanlineStrength)
             return false;
@@ -248,8 +302,9 @@ inline std::string display_settings_to_ini(const DisplaySettings& s) {
          (s.filtering == FilterMode::Linear ? "linear" : "nearest") + "\n";
     o += std::string("vsync = ") + (s.vsync ? "1" : "0") + "\n";
     o += std::string("show_fps = ") + (s.show_fps ? "1" : "0") + "\n";
+    o += std::string("presentation = ") + presentation_mode_name(s.presentation) + "\n";
     o += std::string("crt_enabled = ") + (s.crt_enabled ? "1" : "0") + "\n";
-    o += "crt_preset = lite\n";
+    o += std::string("crt_preset = ") + crt_preset_name(s.crt_preset) + "\n";
     o += "scanline_strength = " + std::to_string(s.scanline_strength) + "\n";
     o += std::string("color_profile = ") +
          (s.color_profile == ColorProfile::GbaLike ? "gba-like" : "off") + "\n";
@@ -264,6 +319,7 @@ inline bool display_settings_parse_ini(DisplaySettings* s, std::string_view text
                                        int* rejected = nullptr) {
     if (!s) return false;
     bool any = false, in_section = false;
+    bool preset_seen = false, strength_seen = false;
     int bad = 0;
     std::size_t pos = 0;
     while (pos <= text.size()) {
@@ -290,9 +346,19 @@ inline bool display_settings_parse_ini(DisplaySettings* s, std::string_view text
         std::string_view value = line.substr(eq + 1);
         const std::size_t hash = value.find('#');
         if (hash != std::string_view::npos) value = value.substr(0, hash);
-        if (display_settings_set(s, trim(line.substr(0, eq)), trim(value))) any = true;
-        else ++bad;
+        const std::string_view key = trim(line.substr(0, eq));
+        if (display_settings_set(s, key, trim(value))) {
+            any = true;
+            if (key == "crt_preset") preset_seen = true;
+            if (key == "scanline_strength") strength_seen = true;
+        } else {
+            ++bad;
+        }
     }
+    // A file that names a preset but no strength means "that preset's look".
+    if (preset_seen && !strength_seen && s->crt_preset != CrtPreset::Custom)
+        s->scanline_strength = crt_preset_params(s->crt_preset, 0).strength;
+    sanitize_display_settings(s);   // reconcile preset <-> strength after all keys
     if (rejected) *rejected = bad;
     return any;
 }

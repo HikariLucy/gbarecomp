@@ -10,17 +10,21 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "color_lut.h"
 #include "display_settings.h"
 #include "host_overlay.h"
 #include "host_perf.h"
+#include "menu_nav.h"
+#include "presentation_pacing.h"
 #include "presentation_layout.h"
 #include "touch_input.h"
 #if defined(GBARECOMP_RUNTIME_UI)
@@ -481,6 +485,8 @@ struct Backend {
     bool         crt_enabled = false;
     int          scanline_strength = kDefaultScanlineStrength;
     ColorProfile color_profile = ColorProfile::Off;
+    CrtPreset    crt_preset = CrtPreset::Lite;
+    PresentationMode presentation = PresentationMode::Native;
     runtime::ColorSettings startup_color;   // model chosen at open (toml/env)
     // The explicit-layout path drives the destination rect itself, so SDL's
     // logical-size letterbox is disabled while it is active (and restored when
@@ -495,6 +501,7 @@ struct Backend {
     int          scanline_tex_h = 0;
     int          scanline_tex_rows = 0;
     int          scanline_tex_strength = -1;
+    double       scanline_tex_shape = 0.0;
     // Developer overlay + meters.
     bool         perf_overlay = false;
     bool         esc_closes_menu = false;   // ESC toggles the runtime menu closed
@@ -509,11 +516,29 @@ struct Backend {
     bool         perf_hotkey = false;   // F10 toggles the overlay (opt-in)
     RateMeter    present_meter{500};
     RateMeter    emu_meter{500};
-    IntervalMeter frame_meter{500};
+    IntervalMeter frame_meter{500};     // PRESENT interval (+ jitter)
+    IntervalMeter emu_interval{500};    // EMU interval (guest frames)
+    std::uint64_t emu_last_total = 0;
     std::uint64_t present_count = 0;
     std::uint64_t perf_dispatch_misses = 0;
     std::uint64_t perf_interpreted_insns = 0;
     int          display_refresh_hz = 0;
+    int          display_index = -1;
+    int          logged_target_hz = -1, logged_refresh_hz = -1;
+    // Repeat presents between guest frames (Monitor Refresh). Disabled (period
+    // 0) in Native, so the default path never touches it.
+    RepeatPresentScheduler repeat;
+    // Menu controller input: direction repeat for D-pad / left stick, and the
+    // latch that keeps buttons held at menu close away from the guest.
+    NavRepeater  nav_repeat{400, 120};
+    NavDir       stick_dir_prev = NavDir::None;
+    InputLatch   input_latch;
+    bool         menu_was_open = false;
+    // Test-only virtual controller (GBARECOMP_TEST_VIRTUAL_PAD=<command file>),
+    // see vpad_open()/vpad_poll(). Unset in normal use.
+    SDL_Joystick* vpad = nullptr;
+    std::string  vpad_path;
+    std::streamoff vpad_offset = 0;
 };
 
 DisplaySettings backend_display_settings(const Backend* b) {
@@ -527,11 +552,57 @@ DisplaySettings backend_display_settings(const Backend* b) {
     s.filtering = b->linear_filter ? FilterMode::Linear : FilterMode::Nearest;
     s.vsync = b->vsync;
     s.show_fps = b->fps_readout;
+    s.presentation = b->presentation;
     s.crt_enabled = b->crt_enabled;
+    s.crt_preset = b->crt_preset;
     s.scanline_strength = b->scanline_strength;
     s.color_profile = b->color_profile;
     sanitize_display_settings(&s);
     return s;
+}
+
+// Refresh rate of the display the window is on. The current mode is what the
+// monitor really runs (it follows fullscreen-desktop); the desktop mode is the
+// fallback some drivers need; 0 = unknown. SDL reports integers (143.98 -> 144).
+int query_display_refresh_hz(SDL_Window* window) {
+    // GBARECOMP_FORCE_REFRESH_HZ=<n>: diagnostic/test override of the detected
+    // refresh (a nested X server reports no useful rate). Evidence gathered with
+    // it is synthetic and is labelled as such in the qualification report.
+    if (const char* forced = std::getenv("GBARECOMP_FORCE_REFRESH_HZ")) {
+        const int hz = sanitize_monitor_hz(std::atoi(forced));
+        if (hz > 0) return hz;
+    }
+    const int idx = SDL_GetWindowDisplayIndex(window);
+    if (idx < 0) return 0;
+    SDL_DisplayMode mode{};
+    int hz = 0;
+    if (SDL_GetCurrentDisplayMode(idx, &mode) == 0) hz = sanitize_monitor_hz(mode.refresh_rate);
+    if (hz == 0 && SDL_GetDesktopDisplayMode(idx, &mode) == 0)
+        hz = sanitize_monitor_hz(mode.refresh_rate);
+    return hz;
+}
+
+std::int64_t steady_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Re-read the monitor refresh and re-derive the repeat-present rate. Cheap; run
+// on open, fullscreen changes, display/window events and mode changes.
+void refresh_presentation_target(Backend* b) {
+    b->display_refresh_hz = query_display_refresh_hz(b->window);
+    const int hz = resolve_present_hz(b->presentation, b->display_refresh_hz);
+    const bool was = b->repeat.enabled();
+    if (hz != b->logged_target_hz || b->display_refresh_hz != b->logged_refresh_hz) {
+        b->logged_target_hz = hz;
+        b->logged_refresh_hz = b->display_refresh_hz;
+        std::fprintf(stderr, "host_window: monitor refresh %s, presentation %s, repeat-present target %d Hz\n",
+                     b->display_refresh_hz > 0 ? (std::to_string(b->display_refresh_hz) + " Hz").c_str() : "unknown",
+                     presentation_mode_name(b->presentation), hz);
+        std::fflush(stderr);
+    }
+    b->repeat.configure(static_cast<double>(hz));
+    if (b->repeat.enabled() && !was) b->repeat.reset(steady_now_ns());
 }
 
 void destroy_scanline_texture(Backend* b) {
@@ -540,6 +611,7 @@ void destroy_scanline_texture(Backend* b) {
     b->scanline_texture = nullptr;
     b->scanline_tex_h = b->scanline_tex_rows = 0;
     b->scanline_tex_strength = -1;
+    b->scanline_tex_shape = 0.0;
 }
 
 // Switch between SDL's logical-size letterbox (default, historical path) and
@@ -559,8 +631,10 @@ void sync_explicit_layout(Backend* b) {
 void draw_scanlines(Backend* b, const SDL_Rect& dst) {
     const double peak = scanline_peak_alpha(b->scanline_strength);
     if (peak <= 0.0 || dst.w <= 0 || dst.h < 2 * b->base_h) return;
+    const double shape = crt_preset_params(b->crt_preset, b->scanline_strength).shape;
     if (!b->scanline_texture || b->scanline_tex_h != dst.h ||
         b->scanline_tex_rows != b->base_h ||
+        b->scanline_tex_shape != shape ||
         b->scanline_tex_strength != b->scanline_strength) {
         destroy_scanline_texture(b);
         SDL_Texture* tex = SDL_CreateTexture(
@@ -568,7 +642,7 @@ void draw_scanlines(Backend* b, const SDL_Rect& dst) {
         if (!tex) return;
         std::vector<Uint32> col(static_cast<std::size_t>(dst.h));
         for (int y = 0; y < dst.h; ++y) {
-            const double a = scanline_row_alpha(y, dst.h, b->base_h, peak);
+            const double a = scanline_row_alpha(y, dst.h, b->base_h, peak, shape);
             col[static_cast<std::size_t>(y)] =
                 static_cast<Uint32>(std::lround(a * 255.0)) << 24;   // black, alpha a
         }
@@ -581,6 +655,7 @@ void draw_scanlines(Backend* b, const SDL_Rect& dst) {
         b->scanline_tex_h = dst.h;
         b->scanline_tex_rows = b->base_h;
         b->scanline_tex_strength = b->scanline_strength;
+        b->scanline_tex_shape = shape;
     }
     SDL_RenderCopy(b->renderer, b->scanline_texture, nullptr, &dst);
 }
@@ -642,6 +717,76 @@ bool ensure_sharp_texture(Backend* b, int factor) {
 #endif
     return true;
 }
+
+// ---- test-only virtual controller ------------------------------------------
+// GBARECOMP_TEST_VIRTUAL_PAD=<file> attaches an SDL virtual game controller and
+// follows commands appended to <file>, one per line:
+//     b <a|b|x|y|back|guide|start|ls|rs|lb|rb|up|down|left|right> <0|1>
+//     a <lx|ly|rx|ry|lt|rt> <-32768..32767>
+// It lets the host-display harness drive the controller paths (menu navigation,
+// input ownership) without touching a physical or system-wide uinput device.
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+void vpad_open(Backend* b) {
+    const char* path = std::getenv("GBARECOMP_TEST_VIRTUAL_PAD");
+    if (!path || !*path) return;
+    SDL_VirtualJoystickDesc desc;
+    SDL_zero(desc);
+    desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
+    desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
+    desc.naxes = SDL_CONTROLLER_AXIS_MAX;
+    desc.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
+    desc.name = "gbarecomp test pad";
+    const int idx = SDL_JoystickAttachVirtualEx(&desc);
+    if (idx < 0) {
+        std::fprintf(stderr, "host_window: virtual test pad unavailable: %s\n", SDL_GetError());
+        return;
+    }
+    b->vpad = SDL_JoystickOpen(idx);
+    b->vpad_path = path;
+    std::fprintf(stderr, "host_window: virtual test pad attached (commands from %s)\n", path);
+}
+
+void vpad_poll(Backend* b) {
+    if (!b->vpad) return;
+    std::ifstream in(b->vpad_path, std::ios::binary);
+    if (!in) return;
+    in.seekg(b->vpad_offset);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (in.eof()) break;                       // partial line: re-read next time
+        b->vpad_offset = in.tellg();
+        char kind = 0, name[16] = {0};
+        int value = 0;
+        if (std::sscanf(line.c_str(), "%c %15s %d", &kind, name, &value) != 3) continue;
+        static const struct { const char* n; int id; } kButtons[] = {
+            {"a", SDL_CONTROLLER_BUTTON_A}, {"b", SDL_CONTROLLER_BUTTON_B},
+            {"x", SDL_CONTROLLER_BUTTON_X}, {"y", SDL_CONTROLLER_BUTTON_Y},
+            {"back", SDL_CONTROLLER_BUTTON_BACK}, {"guide", SDL_CONTROLLER_BUTTON_GUIDE},
+            {"start", SDL_CONTROLLER_BUTTON_START}, {"ls", SDL_CONTROLLER_BUTTON_LEFTSTICK},
+            {"rs", SDL_CONTROLLER_BUTTON_RIGHTSTICK}, {"lb", SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
+            {"rb", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER}, {"up", SDL_CONTROLLER_BUTTON_DPAD_UP},
+            {"down", SDL_CONTROLLER_BUTTON_DPAD_DOWN}, {"left", SDL_CONTROLLER_BUTTON_DPAD_LEFT},
+            {"right", SDL_CONTROLLER_BUTTON_DPAD_RIGHT}};
+        static const struct { const char* n; int id; } kAxes[] = {
+            {"lx", SDL_CONTROLLER_AXIS_LEFTX}, {"ly", SDL_CONTROLLER_AXIS_LEFTY},
+            {"rx", SDL_CONTROLLER_AXIS_RIGHTX}, {"ry", SDL_CONTROLLER_AXIS_RIGHTY},
+            {"lt", SDL_CONTROLLER_AXIS_TRIGGERLEFT}, {"rt", SDL_CONTROLLER_AXIS_TRIGGERRIGHT}};
+        if (kind == 'b') {
+            for (const auto& e : kButtons)
+                if (std::strcmp(e.n, name) == 0)
+                    SDL_JoystickSetVirtualButton(b->vpad, e.id, value ? 1 : 0);
+        } else if (kind == 'a') {
+            for (const auto& e : kAxes)
+                if (std::strcmp(e.n, name) == 0)
+                    SDL_JoystickSetVirtualAxis(b->vpad, e.id,
+                                               static_cast<Sint16>(std::clamp(value, -32768, 32767)));
+        }
+    }
+}
+#else
+void vpad_open(Backend*) {}
+void vpad_poll(Backend*) {}
+#endif
 
 void close_game_controller(Backend* b) {
     if (!b || !b->controller) return;
@@ -1497,31 +1642,45 @@ std::uint64_t audio_underrun_events(Backend* b) {
 // context, never as a game frame rate.
 void draw_perf_overlay(Backend* b, HostOverlay& ov) {
     if (!b->perf_overlay || !ov.text_supported()) return;
-    char lines[5][96];
-    char refresh[24];
+    constexpr int kLines = 6;
+    char lines[kLines][112];
+    char refresh[24], target[40];
     if (b->display_refresh_hz > 0) std::snprintf(refresh, sizeof(refresh), "%d Hz", b->display_refresh_hz);
     else std::snprintf(refresh, sizeof(refresh), "n/a");
-    std::snprintf(lines[0], sizeof(lines[0]), "EMU     %6.2f fps (guest)",
-                  b->emu_meter.rate());
+    if (b->repeat.enabled())
+        std::snprintf(target, sizeof(target), "monitor %d Hz",
+                      static_cast<int>(1e9 / static_cast<double>(b->repeat.period_ns()) + 0.5));
+    else
+        std::snprintf(target, sizeof(target), "native");
+    std::snprintf(lines[0], sizeof(lines[0]), "EMU     %6.2f fps (guest)  %5.2f ms",
+                  b->emu_meter.rate(), b->emu_interval.avg_ms());
     std::snprintf(lines[1], sizeof(lines[1]),
-                  "PRESENT %6.2f fps (host)  display %s",
-                  b->present_meter.rate(), refresh);
-    std::snprintf(lines[2], sizeof(lines[2]), "FRAME   %5.2f ms avg  %5.2f ms max",
-                  b->frame_meter.avg_ms(), b->frame_meter.max_ms());
-    std::snprintf(lines[3], sizeof(lines[3]), "AUDIO   underruns %llu (excl. paused)",
+                  "PRESENT %6.2f fps (host)  target %s",
+                  b->present_meter.rate(), target);
+    std::snprintf(lines[2], sizeof(lines[2]),
+                  "PRESENT %5.2f ms avg %5.2f max  jitter %4.2f ms  display %s",
+                  b->frame_meter.avg_ms(), b->frame_meter.max_ms(),
+                  b->frame_meter.jitter_ms(), refresh);
+    std::snprintf(lines[3], sizeof(lines[3]), "NOTE    repeated frames, not new gameplay frames");
+    std::snprintf(lines[4], sizeof(lines[4]), "AUDIO   underruns %llu (excl. paused)",
                   static_cast<unsigned long long>(audio_underrun_events(b)));
-    std::snprintf(lines[4], sizeof(lines[4]), "STRICT  dispatch misses %llu  interpreted %llu",
+    std::snprintf(lines[5], sizeof(lines[5]), "STRICT  dispatch misses %llu  interpreted %llu",
                   static_cast<unsigned long long>(b->perf_dispatch_misses),
                   static_cast<unsigned long long>(b->perf_interpreted_insns));
+    const int shown = b->repeat.enabled() ? kLines : kLines - 1;
+    if (!b->repeat.enabled()) {            // the note only matters with repeats
+        std::memcpy(lines[3], lines[4], sizeof(lines[3]));
+        std::memcpy(lines[4], lines[5], sizeof(lines[4]));
+    }
     const float size = std::max(13.0f, ov.drawable_height() / 42.0f);
     const float pad = size * 0.5f;
     const float line_h = size * 1.25f;
     float width = 0.0f;
-    for (const auto& l : lines)
-        width = std::max(width, ov.text_width(l, size, OverlaySpace::Drawable));
-    ov.fill_rect(pad, pad, width + pad * 2.0f, line_h * 5 + pad * 2.0f, 4.0f,
+    for (int i = 0; i < shown; ++i)
+        width = std::max(width, ov.text_width(lines[i], size, OverlaySpace::Drawable));
+    ov.fill_rect(pad, pad, width + pad * 2.0f, line_h * shown + pad * 2.0f, 4.0f,
                  {0, 0, 0, 170}, OverlaySpace::Drawable);
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < shown; ++i)
         ov.text(pad * 2.0f, pad * 2.0f + line_h * i, size, {235, 235, 235, 255},
                 lines[i], OverlayAlign::Left, OverlaySpace::Drawable);
 }
@@ -1747,11 +1906,14 @@ bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e,
     if (e.type != SDL_KEYDOWN && e.type != SDL_KEYUP &&
         e.type != SDL_CONTROLLERBUTTONDOWN && e.type != SDL_CONTROLLERBUTTONUP)
         return false;
-    // Platform Back closes an open menu; while the menu is closed it belongs
-    // to the touch layer (a Back gesture for the game, or opening the menu).
-    if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
-        e.key.keysym.scancode == SDL_SCANCODE_AC_BACK &&
-        !recomp_runtime_ui_is_open(ui))
+    // Menu closed: only the open triggers (ESC above, the controller Guide
+    // button below) belong to the menu. Every other key or button keeps flowing
+    // to the hotkey layer and the guest, so Alt+Enter and rebound hotkeys work
+    // with the menu enabled. Platform Back likewise belongs to the touch layer
+    // (a Back gesture for the game, or opening the menu).
+    if (!recomp_runtime_ui_is_open(ui) &&
+        !(e.type == SDL_CONTROLLERBUTTONDOWN &&
+          e.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE))
         return false;
     RecompRuntimeUiInput input;
     bool mapped = true;
@@ -1777,18 +1939,26 @@ bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e,
                     else recomp_runtime_ui_open(ui);
                 }
                 return true;
-            case SDL_CONTROLLER_BUTTON_DPAD_UP: input = RECOMP_RUNTIME_UI_INPUT_UP; break;
-            case SDL_CONTROLLER_BUTTON_DPAD_DOWN: input = RECOMP_RUNTIME_UI_INPUT_DOWN; break;
-            case SDL_CONTROLLER_BUTTON_DPAD_LEFT: input = RECOMP_RUNTIME_UI_INPUT_LEFT; break;
-            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: input = RECOMP_RUNTIME_UI_INPUT_RIGHT; break;
+            // Directions (D-pad and left stick) are polled with a repeat delay
+            // and rate in HostWindow::pump(); the raw button events are only
+            // swallowed here so the guest never sees them.
+            case SDL_CONTROLLER_BUTTON_DPAD_UP:
+            case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+            case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return true;
+            // Semantic actions: south face = accept, east face = back, Start =
+            // resume. SDL's controller vocabulary names the position, not the
+            // glyph, so a Cross/Circle pad behaves the same as an Xbox pad.
             case SDL_CONTROLLER_BUTTON_A: input = RECOMP_RUNTIME_UI_INPUT_ACCEPT; break;
             case SDL_CONTROLLER_BUTTON_B: input = RECOMP_RUNTIME_UI_INPUT_BACK; break;
+            case SDL_CONTROLLER_BUTTON_START:
+                if (pressed) recomp_runtime_ui_close(ui);
+                return true;
             default: mapped = false; break;
         }
     }
-    if (mapped && recomp_runtime_ui_is_open(ui))
-        recomp_runtime_ui_handle_input(ui, input, pressed, repeat);
-    return recomp_runtime_ui_is_open(ui) || mapped;
+    if (mapped) recomp_runtime_ui_handle_input(ui, input, pressed, repeat);
+    return true;
 }
 #endif
 
@@ -2126,6 +2296,9 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     impl_ = b;
     open_ = true;
     g_haptic_window = this;
+    b->display_index = SDL_GetWindowDisplayIndex(b->window);
+    refresh_presentation_target(b);
+    vpad_open(b);
     return true;
 }
 
@@ -2376,6 +2549,8 @@ bool HostWindow::drawable_size(int* width, int* height) const {
            *width > 0 && *height > 0;
 }
 
+static void present_current(Backend* b);
+
 void HostWindow::present(const uint8_t* rgb888) {
     if (!open_ || !impl_ || !rgb888) return;
     auto* b = static_cast<Backend*>(impl_);
@@ -2387,6 +2562,17 @@ void HostWindow::present(const uint8_t* rgb888) {
         rgb888 = b->graded_fb.data();
     }
     SDL_UpdateTexture(b->texture, nullptr, rgb888, b->base_w * 3);
+    present_current(b);
+}
+
+void HostWindow::represent() {
+    if (!open_ || !impl_) return;
+    present_current(static_cast<Backend*>(impl_));
+}
+
+// Draw and swap the framebuffer texture as last uploaded. Shared by present()
+// (new guest frame, uploads first) and represent() (same pixels again).
+static void present_current(Backend* b) {
     SDL_SetRenderDrawColor(b->renderer, 7, 11, 20, 255);
     SDL_RenderClear(b->renderer);
 #if defined(__ANDROID__)
@@ -2533,9 +2719,17 @@ void HostWindow::present(const uint8_t* rgb888) {
             if (b->fps_window_start == 0) b->fps_window_start = now;
             if (now - b->fps_window_start >= 500) {
                 char buf[192];
-                std::snprintf(buf, sizeof(buf), "%s — EMU %.1f | PRESENT %.1f fps",
-                              b->title.c_str(), b->emu_meter.rate(),
-                              b->present_meter.rate());
+                if (b->repeat.enabled())
+                    std::snprintf(buf, sizeof(buf),
+                                  "%s — EMU %.1f | PRESENT %.1f fps | present %.2f ms jitter %.2f ms",
+                                  b->title.c_str(), b->emu_meter.rate(),
+                                  b->present_meter.rate(),
+                                  static_cast<double>(b->repeat.cost_ns()) / 1e6,
+                                  b->frame_meter.jitter_ms());
+                else
+                    std::snprintf(buf, sizeof(buf), "%s — EMU %.1f | PRESENT %.1f fps",
+                                  b->title.c_str(), b->emu_meter.rate(),
+                                  b->present_meter.rate());
                 SDL_SetWindowTitle(b->window, buf);
                 b->fps_window_start = now;
             }
@@ -2625,6 +2819,7 @@ void HostWindow::set_fullscreen(int mode) {
                             : 0;
     if (SDL_SetWindowFullscreen(b->window, flag) == 0) {
         b->fullscreen = mode;
+        refresh_presentation_target(b);
         // Record which panel/mode the cadence data now runs on.
         log_display_mode(b->window,
                          mode == 2 ? "fullscreen-exclusive"
@@ -2928,13 +3123,6 @@ void rewrite_ini_section(const std::string& dir, const char* section,
     if (out) out << ini_replace_section(existing, section, body);
 }
 
-int query_display_refresh_hz(SDL_Window* window) {
-    SDL_DisplayMode mode{};
-    const int idx = SDL_GetWindowDisplayIndex(window);
-    if (idx >= 0 && SDL_GetCurrentDisplayMode(idx, &mode) == 0) return mode.refresh_rate;
-    return 0;
-}
-
 runtime::ColorSettings color_settings_for(const Backend* b, ColorProfile profile) {
     runtime::ColorSettings cs = b->startup_color;
     if (profile == ColorProfile::GbaLike) cs.screen = runtime::ScreenKind::Classic;
@@ -2965,8 +3153,10 @@ void HostWindow::set_display_settings(const DisplaySettings& requested) {
     set_vsync(s.vsync);
     set_crt_enabled(s.crt_enabled);
     set_scanline_strength(s.scanline_strength);
+    b->crt_preset = s.crt_preset;   // after the strength: set_scanline_strength() => Custom
     set_color_profile(s.color_profile);
     set_fps_readout(s.show_fps);
+    set_presentation_mode(s.presentation);
 }
 
 void HostWindow::set_aspect_mode(AspectMode mode) {
@@ -3009,8 +3199,88 @@ void HostWindow::set_crt_enabled(bool on) {
 
 void HostWindow::set_scanline_strength(int percent) {
     if (!open_ || !impl_) return;
-    static_cast<Backend*>(impl_)->scanline_strength =
-        std::clamp(percent, kMinScanlineStrength, kMaxScanlineStrength);
+    auto* b = static_cast<Backend*>(impl_);
+    const int v = std::clamp(percent, kMinScanlineStrength, kMaxScanlineStrength);
+    if (v == b->scanline_strength) return;
+    b->scanline_strength = v;
+    // Moving the slider by hand leaves the named presets: the state stays
+    // consistent (what is shown is what is active) instead of showing "Lite"
+    // with another strength.
+    b->crt_preset = CrtPreset::Custom;
+}
+
+void HostWindow::set_crt_preset(CrtPreset preset) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->crt_preset = preset;
+    if (preset != CrtPreset::Custom)
+        b->scanline_strength = crt_preset_params(preset, b->scanline_strength).strength;
+}
+
+void HostWindow::set_presentation_mode(PresentationMode mode) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->presentation = mode;
+    refresh_presentation_target(b);
+    b->frame_meter.reset();
+}
+
+PresentationMode HostWindow::presentation_mode() const {
+    return open_ && impl_ ? static_cast<const Backend*>(impl_)->presentation
+                          : PresentationMode::Native;
+}
+
+int HostWindow::monitor_refresh_hz() const {
+    return open_ && impl_ ? static_cast<const Backend*>(impl_)->display_refresh_hz : 0;
+}
+
+int HostWindow::present_target_hz() const {
+    if (!open_ || !impl_) return 0;
+    const auto* b = static_cast<const Backend*>(impl_);
+    return b->repeat.enabled()
+        ? static_cast<int>(1e9 / static_cast<double>(b->repeat.period_ns()) + 0.5) : 0;
+}
+
+// Sleep until `wake_ns` (steady clock): coarse sleep, then a short yield tail for
+// accuracy. The tail is kept small because it is paid on every present tick.
+static void sleep_until_ns(std::int64_t wake_ns) {
+    constexpr std::int64_t kTail = 400'000;
+    const std::int64_t now = steady_now_ns();
+    if (wake_ns - now > kTail)
+        std::this_thread::sleep_for(std::chrono::nanoseconds(wake_ns - kTail - now));
+    while (steady_now_ns() < wake_ns) std::this_thread::yield();
+}
+
+void HostWindow::present_repeats_until(std::int64_t guest_deadline_ns) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    if (!b->repeat.enabled()) return;
+    // The guest-frame present that just happened already used a tick.
+    b->repeat.note_present(steady_now_ns());
+    for (;;) {
+        const auto step = b->repeat.next(steady_now_ns(), guest_deadline_ns);
+        if (step.action == RepeatPresentScheduler::Action::Done) return;
+        if (step.action == RepeatPresentScheduler::Action::Sleep) {
+            sleep_until_ns(step.wake_ns);
+            continue;
+        }
+        const std::int64_t t0 = steady_now_ns();
+        present_current(b);
+        const std::int64_t t1 = steady_now_ns();
+        b->repeat.note_repeat_cost(t1 - t0);
+        b->repeat.note_present(t1);
+        SDL_PumpEvents();   // keep the window responsive; input is read by pump()
+    }
+}
+
+bool HostWindow::wait_presentation_tick() {
+    if (!open_ || !impl_) return false;
+    auto* b = static_cast<Backend*>(impl_);
+    if (!b->repeat.enabled()) return false;
+    const std::int64_t now = steady_now_ns();
+    b->repeat.note_present(now);
+    sleep_until_ns(b->repeat.next_tick_ns());
+    return true;
 }
 
 void HostWindow::set_color_profile(ColorProfile profile) {
@@ -3061,8 +3331,10 @@ void HostWindow::set_perf_overlay(bool on) {
     b->perf_overlay = on;
     b->present_meter.reset();
     b->emu_meter.reset();
+    b->frame_meter.reset();
+    b->emu_interval.reset();
     b->present_count = 0;
-    if (on) b->display_refresh_hz = query_display_refresh_hz(b->window);
+    if (on) refresh_presentation_target(b);
 }
 
 void HostWindow::set_esc_closes_menu(bool enabled) {
@@ -3103,7 +3375,16 @@ void HostWindow::note_emulated_frames(std::uint64_t total_frames) {
     if (!open_ || !impl_) return;
     auto* b = static_cast<Backend*>(impl_);
     settle_underrun_grace(b);
-    if (b->fps_readout || b->perf_overlay) b->emu_meter.sample(total_frames, SDL_GetTicks());
+    if (b->fps_readout || b->perf_overlay) {
+        b->emu_meter.sample(total_frames, SDL_GetTicks());
+        // EMU frame time only advances with the guest: a held guest or a repeated
+        // present leaves the counter flat and adds no sample.
+        if (total_frames != b->emu_last_total) {
+            b->emu_last_total = total_frames;
+            b->emu_interval.tick(SDL_GetPerformanceCounter() * 1000000ull /
+                                 SDL_GetPerformanceFrequency());
+        }
+    }
 }
 
 void HostWindow::set_perf_strict_counters(std::uint64_t dispatch_misses,
@@ -3122,8 +3403,13 @@ HostWindow::PerfSnapshot HostWindow::perf_snapshot() const {
     p.present_fps = b->present_meter.rate();
     p.frame_ms_avg = b->frame_meter.avg_ms();
     p.frame_ms_max = b->frame_meter.max_ms();
+    p.present_jitter_ms = b->frame_meter.jitter_ms();
+    p.emu_frame_ms_avg = b->emu_interval.avg_ms();
+    p.emu_frame_ms_max = b->emu_interval.max_ms();
     p.audio_underruns = audio_underrun_events(b);
     p.display_refresh_hz = b->display_refresh_hz;
+    p.present_target_hz = b->repeat.enabled()
+        ? static_cast<int>(1e9 / static_cast<double>(b->repeat.period_ns()) + 0.5) : 0;
     return p;
 }
 
@@ -3136,9 +3422,21 @@ HostWindow::Events HostWindow::pump() {
     Events ev{};
     if (!open_) { ev.quit = true; return ev; }
     auto* b = static_cast<Backend*>(impl_);
+    vpad_poll(b);
 
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        // Window-mode hotkey (default Alt+Enter), handled before the menu sees
+        // the event so it works with the menu open or closed and never doubles as
+        // "accept". Edge-triggered: key auto-repeat is swallowed, not toggled.
+        if (e.type == SDL_KEYDOWN) {
+            const HotkeyBind& fs = b->hotkeys[HK_FULLSCREEN];
+            if (fs.key != SDLK_UNKNOWN && e.key.keysym.sym == fs.key &&
+                hotkey_mods_ok(fs, e.key.keysym.mod)) {
+                if (!e.key.repeat) ev.toggle_fullscreen = true;
+                continue;
+            }
+        }
 #if defined(GBARECOMP_RUNTIME_UI)
         const bool finger_event =
             e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION ||
@@ -3194,6 +3492,20 @@ HostWindow::Events HostWindow::pump() {
         } else if (e.type == SDL_WINDOWEVENT &&
                    e.window.event == SDL_WINDOWEVENT_CLOSE) {
             ev.quit = true;
+        } else if (e.type == SDL_WINDOWEVENT &&
+                   (e.window.event == SDL_WINDOWEVENT_MOVED ||
+                    e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+                    || e.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED
+#endif
+                    )) {
+            // Moved to another monitor (or its mode changed): re-read the
+            // refresh so Monitor Refresh follows the display the window is on.
+            const int idx = SDL_GetWindowDisplayIndex(b->window);
+            if (idx != b->display_index || e.window.event != SDL_WINDOWEVENT_MOVED) {
+                b->display_index = idx;
+                refresh_presentation_target(b);
+            }
         } else if (e.type == SDL_FINGERDOWN ||
                    e.type == SDL_FINGERMOTION ||
                    e.type == SDL_FINGERUP) {
@@ -3414,8 +3726,54 @@ HostWindow::Events HostWindow::pump() {
     }
     ev.keyinput = keys;
 #if defined(GBARECOMP_RUNTIME_UI)
-    if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui))
+    // Input ownership. Menu open: the menu consumes navigation and the guest
+    // reads "all released". Menu just closed: anything still held (the B that
+    // closed it, the A that chose Resume) stays masked until released once, so
+    // closing the menu never presses a game button.
+    const bool menu_open_now = b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui);
+    if (menu_open_now) {
+        if (!b->menu_was_open) {
+            // A direction already held when the menu opened must not scroll it.
+            b->nav_repeat.require_neutral();
+            b->stick_dir_prev = NavDir::None;
+            b->input_latch.clear();
+        }
+        NavDir dir = NavDir::None;
+        if (b->controller && SDL_GameControllerGetAttached(b->controller)) {
+            SDL_GameController* c = b->controller;
+            if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP)) dir = NavDir::Up;
+            else if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) dir = NavDir::Down;
+            else if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) dir = NavDir::Left;
+            else if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) dir = NavDir::Right;
+            if (dir == NavDir::None) {
+                b->stick_dir_prev = stick_direction(
+                    SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX),
+                    SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY),
+                    b->stick_dir_prev);
+                dir = b->stick_dir_prev;
+            } else {
+                b->stick_dir_prev = NavDir::None;
+            }
+        }
+        const NavRepeater::Fire f = b->nav_repeat.update(dir, SDL_GetTicks());
+        if (f.dir != NavDir::None) {
+            const RecompRuntimeUiInput in =
+                f.dir == NavDir::Up ? RECOMP_RUNTIME_UI_INPUT_UP
+              : f.dir == NavDir::Down ? RECOMP_RUNTIME_UI_INPUT_DOWN
+              : f.dir == NavDir::Left ? RECOMP_RUNTIME_UI_INPUT_LEFT
+                                      : RECOMP_RUNTIME_UI_INPUT_RIGHT;
+            recomp_runtime_ui_handle_input(b->runtime_ui, in, 1, f.repeat ? 1 : 0);
+            recomp_runtime_ui_handle_input(b->runtime_ui, in, 0, 0);
+        }
         ev.keyinput = 0x03FFu;
+    } else {
+        if (b->menu_was_open) {
+            b->input_latch.begin(keys);
+            b->nav_repeat.reset();
+        }
+        if (b->input_latch.active()) ev.keyinput = b->input_latch.apply(keys);
+    }
+    b->menu_was_open = menu_open_now;
 #endif
 
     int mouse_x = 0;
@@ -3573,7 +3931,15 @@ void HostWindow::set_vsync(bool) {}
 bool HostWindow::vsync() const { return false; }
 void HostWindow::set_crt_enabled(bool) {}
 void HostWindow::set_scanline_strength(int) {}
+void HostWindow::set_crt_preset(CrtPreset) {}
 void HostWindow::set_color_profile(ColorProfile) {}
+void HostWindow::set_presentation_mode(PresentationMode) {}
+PresentationMode HostWindow::presentation_mode() const { return PresentationMode::Native; }
+int HostWindow::monitor_refresh_hz() const { return 0; }
+int HostWindow::present_target_hz() const { return 0; }
+void HostWindow::represent() {}
+void HostWindow::present_repeats_until(std::int64_t) {}
+bool HostWindow::wait_presentation_tick() { return false; }
 bool HostWindow::load_display_settings() { return false; }
 void HostWindow::save_display_settings() const {}
 void HostWindow::set_perf_overlay(bool) {}

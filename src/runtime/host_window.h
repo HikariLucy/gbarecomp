@@ -151,8 +151,30 @@ public:
     void set_vsync(bool on);
     bool vsync() const;
     void set_crt_enabled(bool on);
-    void set_scanline_strength(int percent);
+    void set_scanline_strength(int percent);   // a manual change makes the preset Custom
+    // Selecting a named preset also sets its scanline strength; Custom keeps the
+    // current one.
+    void set_crt_preset(CrtPreset preset);
     void set_color_profile(ColorProfile profile);
+    // Presentation pacing (presentation_pacing.h). Presentation only: the guest
+    // keeps its 59.7275 Hz clock whatever is selected.
+    void set_presentation_mode(PresentationMode mode);
+    PresentationMode presentation_mode() const;
+    // Monitor refresh of the window's display as SDL reports it (0 = unknown).
+    int monitor_refresh_hz() const;
+    // Effective repeat-present rate: 0 = one present per guest frame (Native, an
+    // unknown refresh, or a monitor close to the guest rate).
+    int present_target_hz() const;
+    // Re-present the framebuffer uploaded by the last present(): no texture
+    // upload, no guest involvement. Counts as a PRESENT, never as an EMU frame.
+    void represent();
+    // While the guest waits for its next frame (deadline = std::chrono::
+    // steady_clock time in ns since its epoch), keep presenting the current
+    // frame at present_target_hz(). Returns at once when the target is 0.
+    void present_repeats_until(std::int64_t guest_deadline_ns);
+    // Paused/menu path: sleep to the next presentation tick. Returns false when
+    // the caller should use its own idle sleep (Native or unknown refresh).
+    bool wait_presentation_tick();
     // Persistence: [Display] in <dir>/config.ini (the directory given to
     // set_touch_config_dir). load returns false when no valid section exists;
     // invalid values keep the current setting. Other sections are preserved.
@@ -182,10 +204,14 @@ public:
     struct PerfSnapshot {
         double emu_fps = 0.0;
         double present_fps = 0.0;
-        double frame_ms_avg = 0.0;
+        double frame_ms_avg = 0.0;       // PRESENT interval (host presents)
         double frame_ms_max = 0.0;
+        double present_jitter_ms = 0.0;  // std-dev of the PRESENT interval
+        double emu_frame_ms_avg = 0.0;   // EMU interval (guest frames)
+        double emu_frame_ms_max = 0.0;
         std::uint64_t audio_underruns = 0;
         int display_refresh_hz = 0;   // monitor refresh of the window's display
+        int present_target_hz = 0;    // 0 = Native (one present per guest frame)
     };
     PerfSnapshot perf_snapshot() const;
     bool assist_tools_enabled() const;

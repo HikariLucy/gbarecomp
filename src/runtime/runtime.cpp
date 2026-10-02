@@ -241,6 +241,7 @@ struct Args {
 #define GBARECOMP_UI_KEY_DISPLAY_RESET   "display.reset_defaults"
 #define GBARECOMP_UI_KEY_VSYNC           "performance.vsync"
 #define GBARECOMP_UI_KEY_PERF_OVERLAY    "performance.overlay"
+#define GBARECOMP_UI_KEY_PRESENTATION    "performance.presentation"
 #define GBARECOMP_UI_KEY_CRT             "graphics.crt"
 #define GBARECOMP_UI_KEY_SCANLINES       "graphics.scanline_strength"
 #define GBARECOMP_UI_KEY_COLOR_PROFILE   "graphics.color_profile"
@@ -288,8 +289,13 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
         *out = c->window->vsync();
     else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_PERF_OVERLAY) == 0)
         *out = c->window->perf_overlay();
-    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_CRT) == 0)
-        *out = c->window->display_settings().crt_enabled;
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_PRESENTATION) == 0)
+        *out = static_cast<int>(c->window->presentation_mode());
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_CRT) == 0) {
+        // 0 = Off, 1..4 = Lite, Soft, Strong, Custom (CrtPreset order + 1).
+        const DisplaySettings ds = c->window->display_settings();
+        *out = ds.crt_enabled ? 1 + static_cast<int>(ds.crt_preset) : 0;
+    }
     else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_SCANLINES) == 0)
         *out = c->window->display_settings().scanline_strength;
     else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_COLOR_PROFILE) == 0)
@@ -339,8 +345,14 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
         c->window->set_vsync(value != 0);
     else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_PERF_OVERLAY) == 0)
         c->window->set_perf_overlay(value != 0);
-    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_CRT) == 0)
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_PRESENTATION) == 0)
+        c->window->set_presentation_mode(value ? PresentationMode::MonitorRefresh
+                                               : PresentationMode::Native);
+    else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_CRT) == 0) {
         c->window->set_crt_enabled(value != 0);
+        if (value > 0)
+            c->window->set_crt_preset(static_cast<CrtPreset>(std::clamp(value - 1, 0, 3)));
+    }
     else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_SCANLINES) == 0)
         c->window->set_scanline_strength(value);
     else if (c->display_enhancements && std::strcmp(item->key, GBARECOMP_UI_KEY_COLOR_PROFILE) == 0)
@@ -3164,6 +3176,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (opts.expose_display_enhancements) {
             static const char* const kAspectChoices[] = {"Native 3:2", "Stretch"};
             static const char* const kColorChoices[] = {"Off", "GBA-like (approx.)"};
+            static const char* const kCrtChoices[] = {"Off", "Lite", "Soft", "Strong", "Custom"};
+            static const char* const kPresentationChoices[] = {"Native", "Monitor Refresh"};
             auto add = [&](const char* key, const char* section, const char* label,
                            const char* desc, RecompRuntimeUiItemType type, int mn,
                            int mx, int step, const char* const* choices = nullptr,
@@ -3181,11 +3195,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             add(GBARECOMP_UI_KEY_DISPLAY_RESET, "Display", "Restore display defaults",
                 "Reset every display and graphics option on this page to its default.",
                 RECOMP_RUNTIME_UI_ACTION, 0, 0, 0);
-            add(GBARECOMP_UI_KEY_CRT, "Graphics", "CRT Lite",
-                "Subtle scanlines over the final image (needs a window at least 2x). Presentation only.",
-                RECOMP_RUNTIME_UI_BOOL, 0, 1, 1);
+            add(GBARECOMP_UI_KEY_CRT, "Graphics", "CRT",
+                "Scanline presets over the final image (needs a window at least 2x): Lite, Soft, Strong. Custom keeps the strength set below. Presentation only.",
+                RECOMP_RUNTIME_UI_CHOICE, 0, 4, 1, kCrtChoices, 5);
             add(GBARECOMP_UI_KEY_SCANLINES, "Graphics", "Scanline strength",
-                "0-100%. Capped so the image always stays readable.",
+                "0-100%; 0 is off. Capped so the image always stays readable. Changing it switches the CRT preset to Custom.",
                 RECOMP_RUNTIME_UI_INT, kMinScanlineStrength, kMaxScanlineStrength, 5);
             add(GBARECOMP_UI_KEY_COLOR_PROFILE, "Graphics", "Color correction",
                 "GBA-like is an approximation from published panel measurements, not an exact LCD emulation.",
@@ -3196,6 +3210,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             add(GBARECOMP_UI_KEY_PERF_OVERLAY, "Performance", "Performance overlay",
                 "EMU/PRESENT rates, frame time, audio underruns and strict-static counters (F10).",
                 RECOMP_RUNTIME_UI_BOOL, 0, 1, 1);
+            add(GBARECOMP_UI_KEY_PRESENTATION, "Performance", "Presentation Refresh",
+                "Native shows one image per game frame. Monitor Refresh re-presents the current frame at your monitor's rate between game frames. The game itself always runs at 59.73 Hz: repeated frames are not new gameplay frames and nothing is interpolated.",
+                RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, kPresentationChoices, 2);
         }
 
         if (opts.ui_extra_items && opts.ui_extra_item_count) {
@@ -3632,12 +3649,22 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                               (ev.fast_forward || fast_forward_latched);
         // System hotkeys (config.ini [KeyMap], rebindable in the launcher).
         if (ev.toggle_fullscreen) {
-            // Toggle between windowed and the configured mode. A session
-            // launched windowed (args.fullscreen == 0) defaults its on-mode
-            // to borderless (1); a session launched into a specific mode
-            // toggles back into that same mode.
-            const int on_mode = args.fullscreen ? args.fullscreen : 1;
-            win.set_fullscreen(win.fullscreen() ? 0 : on_mode);
+            if (opts.expose_display_enhancements) {
+                // Alt+Enter (the Fullscreen hotkey): Windowed <-> Borderless
+                // fullscreen. Exclusive is never entered from here; leaving it
+                // goes to Windowed. The result is persisted like a menu change.
+                const WindowMode next =
+                    toggle_window_mode(win.display_settings().window_mode);
+                win.set_fullscreen(next == WindowMode::Borderless ? 1 : 0);
+                win.save_display_settings();
+            } else {
+                // Toggle between windowed and the configured mode. A session
+                // launched windowed (args.fullscreen == 0) defaults its on-mode
+                // to borderless (1); a session launched into a specific mode
+                // toggles back into that same mode.
+                const int on_mode = args.fullscreen ? args.fullscreen : 1;
+                win.set_fullscreen(win.fullscreen() ? 0 : on_mode);
+            }
         }
         if (ev.window_bigger)  win.adjust_scale(+1);
         if (ev.window_smaller) win.adjust_scale(-1);
@@ -3745,6 +3772,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
     };
 
+    // Guest frame pacing. FramePacer owns the 59.7275 Hz guest clock. In Monitor
+    // Refresh presentation the wait for the next guest frame is first spent
+    // re-presenting the current framebuffer at the monitor's rate; those repeats
+    // are host-only (no guest step, no audio drain, no state access) and always
+    // end before the guest deadline, which the pacer then enforces unchanged.
+    auto pace_guest_frame = [&]() {
+        if (!pacer) return;
+        if (args.window && !pacer->uncapped() && !fast_forward_active &&
+            win.present_target_hz() > 0)
+            win.present_repeats_until(pacer->next_deadline_ns());
+        pacer->wait_for_next_frame();
+    };
     if (args.window) {
         runtime_set_host_service_hook([&]() { win.service_events(); });
     }
@@ -3819,7 +3858,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     ++frames_presented;
                     if (args.frames >= 0 && frames_presented >= args.frames)
                         host_quit = true;
-                    if (pacer) pacer->wait_for_next_frame();
+                    pace_guest_frame();
                 }
                 if (phase_active) {
                     frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3,
@@ -4129,7 +4168,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             // PRESENT keeps ticking: the two rates are genuinely separate.
             win.note_emulated_frames(ppu.frame_count());
             win.present(live_fb.data());
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // Monitor Refresh: idle at the presentation tick (the menu stays
+            // as responsive as the monitor allows). Native: the historical
+            // ~100 Hz idle.
+            if (!win.wait_presentation_tick())
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         // Realign the pacer so resuming does not burn the wall-clock lag
         // accumulated while the menu was up (hotkey pause does this itself).
@@ -4254,7 +4297,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     // Normal play presents/paces every frame. Fast-forward
                     // runs N guest frames per one paced host presentation,
                     // making its selected multiplier independent of monitor Hz.
-                    if (pacer) pacer->wait_for_next_frame();
+                    pace_guest_frame();
                 }
                 if (phase_active) {
                     frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3,

@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,14 @@ public:
     // Block until the next frame's deadline. Call once per presented
     // frame. No-op while uncapped.
     void wait_for_next_frame();
+
+    // The next guest-frame deadline as steady_clock nanoseconds since its epoch.
+    // Lets the host spend the wait re-presenting (see HostWindow::
+    // present_repeats_until) without owning or altering the guest clock.
+    std::int64_t next_deadline_ns() const {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   next_.time_since_epoch()).count();
+    }
 
     // Realign the deadline to "now". Call after any non-real-time jump
     // (startup, save-state load) so the pacer doesn't try to catch up.
